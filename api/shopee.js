@@ -9,8 +9,8 @@ import crypto from 'crypto';
 import { ProxyAgent, fetch as undiciFetch } from 'undici';
 
 const HOSTS = {
-  sandbox: 'https://partner.test-stable.shopeemobile.com',
-  producao: 'https://partner.shopeemobile.com'
+  sandbox: 'https://openplatform.sandbox.test-stable.shopee.sg',
+  producao: 'https://partner.shopeemobile.com' // será confirmado quando a produção for aprovada
 };
 
 function gerarAssinatura(path, timestamp, partnerId, partnerKey, accessToken='', shopId=''){
