@@ -20,10 +20,10 @@ function gerarAssinatura(path, timestamp, partnerId, partnerKey, accessToken='',
 
 // Faz a chamada HTTP passando SEMPRE pelo proxy do QuotaGuard (IP fixo)
 async function chamarShopee(path, params = {}, metodo = 'GET') {
-  const partnerId = process.env.SHOPEE_PARTNER_ID;
-  const partnerKey = process.env.SHOPEE_PARTNER_KEY;
-  const ambiente = process.env.SHOPEE_AMBIENTE || 'sandbox';
-  const quotaguardUrl = process.env.QUOTAGUARD_URL;
+  const partnerId = (process.env.SHOPEE_PARTNER_ID || '').trim();
+  const partnerKey = (process.env.SHOPEE_PARTNER_KEY || '').trim();
+  const ambiente = (process.env.SHOPEE_AMBIENTE || 'sandbox').trim();
+  const quotaguardUrl = (process.env.QUOTAGUARD_URL || '').trim();
   const host = HOSTS[ambiente];
 
   if (!partnerId || !partnerKey) throw new Error('Credenciais da Shopee não configuradas na Vercel.');
@@ -56,9 +56,9 @@ export default async function handler(req, res) {
 
     // 1) Gerar o link de autorização (pra cliente aprovar o acesso da loja dele)
     if (acao === 'gerar_link_autorizacao') {
-      const partnerId = process.env.SHOPEE_PARTNER_ID;
-      const partnerKey = process.env.SHOPEE_PARTNER_KEY;
-      const ambiente = process.env.SHOPEE_AMBIENTE || 'sandbox';
+      const partnerId = (process.env.SHOPEE_PARTNER_ID || '').trim();
+      const partnerKey = (process.env.SHOPEE_PARTNER_KEY || '').trim();
+      const ambiente = (process.env.SHOPEE_AMBIENTE || 'sandbox').trim();
       const redirectUrl = req.query.redirect || req.body.redirect;
       const path = '/api/v2/shop/auth_partner';
       const timestamp = Math.floor(Date.now() / 1000);
@@ -70,9 +70,9 @@ export default async function handler(req, res) {
     // 2) Trocar o "code" (recebido após o cliente autorizar) por um access_token
     if (acao === 'trocar_codigo_por_token') {
       const { code, shop_id } = req.method === 'GET' ? req.query : req.body;
-      const partnerId = process.env.SHOPEE_PARTNER_ID;
-      const partnerKey = process.env.SHOPEE_PARTNER_KEY;
-      const ambiente = process.env.SHOPEE_AMBIENTE || 'sandbox';
+      const partnerId = (process.env.SHOPEE_PARTNER_ID || '').trim();
+      const partnerKey = (process.env.SHOPEE_PARTNER_KEY || '').trim();
+      const ambiente = (process.env.SHOPEE_AMBIENTE || 'sandbox').trim();
       const path = '/api/v2/auth/token/get';
       const timestamp = Math.floor(Date.now() / 1000);
       const sign = gerarAssinatura(path, timestamp, partnerId, partnerKey);
@@ -115,6 +115,23 @@ export default async function handler(req, res) {
       } while (cursor);
 
       return res.status(200).json({ ok: true, totalPedidos, aviso: 'Contagem de pedidos ok — soma de valores (GMV) requer segunda etapa com get_order_detail.' });
+    }
+
+    // Diagnóstico: mostra o TAMANHO das credenciais (nunca o valor), pra detectar espaço/quebra de linha acidental
+    if (acao === 'diagnostico') {
+      const pid = process.env.SHOPEE_PARTNER_ID || '';
+      const pkey = process.env.SHOPEE_PARTNER_KEY || '';
+      const qg = process.env.QUOTAGUARD_URL || '';
+      return res.status(200).json({
+        ok: true,
+        partner_id_valor: pid,
+        partner_id_tamanho: pid.length,
+        partner_key_tamanho: pkey.length,
+        partner_key_comeca_com: pkey.slice(0, 4),
+        partner_key_termina_com: pkey.slice(-4),
+        quotaguard_configurado: !!qg,
+        ambiente: process.env.SHOPEE_AMBIENTE || 'sandbox'
+      });
     }
 
     return res.status(400).json({ erro: 'Ação não reconhecida.' });
