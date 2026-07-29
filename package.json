@@ -1,0 +1,9 @@
+{
+  "name": "lb-shopee-gmv",
+  "version": "1.0.0",
+  "description": "Intermediário seguro LB para integração com a Shopee Open Platform (GMV)",
+  "private": true,
+  "dependencies": {
+    "undici": "^6.19.0"
+  }
+}
