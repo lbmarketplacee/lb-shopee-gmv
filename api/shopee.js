@@ -103,8 +103,19 @@ export default async function handler(req, res) {
       const { access_token, shop_id, data_inicio, data_fim } = params;
       const timeFrom = Math.floor(new Date(data_inicio).getTime() / 1000);
       const timeTo = Math.floor(new Date(data_fim).getTime() / 1000);
+      const debug = { timeFrom, timeTo, chamadasListaOrdem: [] };
 
-      // Passo A: lista os números de pedido (order_sn) do período, paginando
+      // Passo A: lista os números de pedido (order_sn) do período, paginando — SEM filtro de status primeiro (diagnóstico)
+      let todosOrderSnTodosStatus = [], cursorDiag = '';
+      const diagResultado = await chamarShopee('/api/v2/order/get_order_list', {
+        access_token, shop_id,
+        time_range_field: 'create_time',
+        time_from: timeFrom, time_to: timeTo,
+        page_size: 20, cursor: ''
+      });
+      debug.respostaListaBruta = diagResultado; // resposta crua da primeira página, sem filtro de status
+
+      // Passo B: agora sim, busca de verdade só os concluídos
       let todosOrderSn = [], cursor = '', paginas = 0;
       do {
         const resultado = await chamarShopee('/api/v2/order/get_order_list', {
@@ -122,11 +133,12 @@ export default async function handler(req, res) {
       } while (cursor);
 
       if (!todosOrderSn.length) {
-        return res.status(200).json({ ok: true, gmv: 0, totalPedidos: 0 });
+        return res.status(200).json({ ok: true, gmv: 0, totalPedidos: 0, debug });
       }
 
-      // Passo B: busca o VALOR de cada pedido (get_order_detail aceita até 50 por chamada)
+      // Passo C: busca o VALOR de cada pedido (get_order_detail aceita até 50 por chamada)
       let gmvTotal = 0;
+      let ultimoDetalheResposta = null;
       for (let i = 0; i < todosOrderSn.length; i += 50) {
         const lote = todosOrderSn.slice(i, i + 50);
         const detalhe = await chamarShopee('/api/v2/order/get_order_detail', {
@@ -134,11 +146,13 @@ export default async function handler(req, res) {
           order_sn_list: lote.join(','),
           response_optional_fields: 'total_amount'
         });
+        ultimoDetalheResposta = detalhe;
         const pedidos = detalhe?.response?.order_list || [];
         pedidos.forEach(p => { gmvTotal += Number(p.total_amount) || 0; });
       }
+      debug.ultimoDetalheResposta = ultimoDetalheResposta;
 
-      return res.status(200).json({ ok: true, gmv: gmvTotal, totalPedidos: todosOrderSn.length });
+      return res.status(200).json({ ok: true, gmv: gmvTotal, totalPedidos: todosOrderSn.length, debug });
     }
 
     return res.status(400).json({ erro: 'Ação não reconhecida.' });
