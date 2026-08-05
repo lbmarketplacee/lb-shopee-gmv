@@ -101,36 +101,52 @@ export default async function handler(req, res) {
     // 4) Buscar o GMV de uma loja num período — soma o valor de todos os pedidos concluídos
     if (acao === 'buscar_gmv') {
       const { access_token, shop_id, data_inicio, data_fim } = params;
-      const timeFrom = Math.floor(new Date(data_inicio).getTime() / 1000);
-      const timeTo = Math.floor(new Date(data_fim).getTime() / 1000);
-      const debug = { timeFrom, timeTo, chamadasListaOrdem: [] };
+      const timeFromTotal = Math.floor(new Date(data_inicio).getTime() / 1000);
+      const timeToTotal = Math.floor(new Date(data_fim).getTime() / 1000);
+      const debug = { timeFromTotal, timeToTotal, janelas: [] };
 
-      // Passo A: lista os números de pedido (order_sn) do período, paginando — SEM filtro de status primeiro (diagnóstico)
-      let todosOrderSnTodosStatus = [], cursorDiag = '';
-      const diagResultado = await chamarShopee('/api/v2/order/get_order_list', {
-        access_token, shop_id,
-        time_range_field: 'create_time',
-        time_from: timeFrom, time_to: timeTo,
-        page_size: 20, cursor: ''
-      });
-      debug.respostaListaBruta = diagResultado; // resposta crua da primeira página, sem filtro de status
+      // A Shopee limita get_order_list a no máximo 15 dias por chamada.
+      // Então dividimos o período pedido em pedaços de até 15 dias cada.
+      const QUINZE_DIAS = 15 * 24 * 60 * 60;
+      const janelas = [];
+      let inicioJanela = timeFromTotal;
+      while (inicioJanela < timeToTotal) {
+        const fimJanela = Math.min(inicioJanela + QUINZE_DIAS - 1, timeToTotal);
+        janelas.push([inicioJanela, fimJanela]);
+        inicioJanela = fimJanela + 1;
+      }
 
-      // Passo B: agora sim, busca de verdade só os concluídos
-      let todosOrderSn = [], cursor = '', paginas = 0;
-      do {
-        const resultado = await chamarShopee('/api/v2/order/get_order_list', {
-          access_token, shop_id,
-          time_range_field: 'create_time',
-          time_from: timeFrom, time_to: timeTo,
-          page_size: 100, cursor,
-          order_status: 'COMPLETED'
-        });
-        const lista = resultado?.response?.order_list || [];
-        todosOrderSn.push(...lista.map(o => o.order_sn));
-        cursor = resultado?.response?.next_cursor || '';
-        paginas++;
-        if (paginas > 30) break; // segurança
-      } while (cursor);
+      let todosOrderSn = [];
+      let primeiraRespostaBruta = null;
+      for (const [timeFrom, timeTo] of janelas) {
+        // Diagnóstico (só na primeira janela, pra não gastar chamada à toa)
+        if (!primeiraRespostaBruta) {
+          primeiraRespostaBruta = await chamarShopee('/api/v2/order/get_order_list', {
+            access_token, shop_id,
+            time_range_field: 'create_time',
+            time_from: timeFrom, time_to: timeTo,
+            page_size: 20, cursor: ''
+          });
+        }
+        // Busca de verdade, só os concluídos, paginando dentro dessa janela de 15 dias
+        let cursor = '', paginas = 0;
+        do {
+          const resultado = await chamarShopee('/api/v2/order/get_order_list', {
+            access_token, shop_id,
+            time_range_field: 'create_time',
+            time_from: timeFrom, time_to: timeTo,
+            page_size: 100, cursor,
+            order_status: 'COMPLETED'
+          });
+          const lista = resultado?.response?.order_list || [];
+          todosOrderSn.push(...lista.map(o => o.order_sn));
+          cursor = resultado?.response?.next_cursor || '';
+          paginas++;
+          if (paginas > 30) break;
+        } while (cursor);
+        debug.janelas.push({ timeFrom, timeTo });
+      }
+      debug.respostaListaBruta = primeiraRespostaBruta;
 
       if (!todosOrderSn.length) {
         return res.status(200).json({ ok: true, gmv: 0, totalPedidos: 0, debug });
