@@ -207,7 +207,7 @@ export default async function handler(req, res) {
         min_basket_price: Number(valor_minimo || 0),
         usage_quantity: Number(quantidade || 5000)
       };
-      const resultado = await chamarShopee('/api/v2/voucher/add_voucher', {}, 'POST', corpo);
+      const resultado = await chamarShopee('/api/v2/voucher/add_voucher', { access_token, shop_id }, 'POST', corpo);
       return res.status(200).json({ ok: true, ...resultado });
     }
 
