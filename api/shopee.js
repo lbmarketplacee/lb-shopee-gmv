@@ -194,7 +194,8 @@ export default async function handler(req, res) {
     if (acao === 'criar_cupom') {
       const { access_token, shop_id, nome, codigo, percentual, valor_minimo, desconto_maximo, quantidade, dias_validade } = params;
       const agora = Math.floor(Date.now() / 1000);
-      const fim = agora + (Number(dias_validade || 180) * 86400);
+      const diasFinal = Math.min(Number(dias_validade || 90), 90); // Shopee exige no máximo 90 dias (3 meses)
+      const fim = agora + (diasFinal * 86400);
       const corpo = {
         voucher_name: nome,
         voucher_code: codigo,
