@@ -171,6 +171,46 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, gmv: gmvTotal, totalPedidos: todosOrderSn.length, debug });
     }
 
+    // 5) Saúde da Loja — nota geral, penalidades, pedidos atrasados
+    if (acao === 'saude_loja') {
+      const { access_token, shop_id } = params;
+      const [performance, penalidade] = await Promise.all([
+        chamarShopee('/api/v2/account_health/get_shop_performance', { access_token, shop_id }),
+        chamarShopee('/api/v2/account_health/get_penalty', { access_token, shop_id })
+      ]);
+      return res.status(200).json({ ok: true, performance, penalidade });
+    }
+
+    // 6) Listar cupons já criados na loja
+    if (acao === 'listar_cupons') {
+      const { access_token, shop_id, status } = params;
+      const resultado = await chamarShopee('/api/v2/voucher/get_voucher_list', {
+        access_token, shop_id, status: status || 'all', page_size: 100
+      });
+      return res.status(200).json({ ok: true, ...resultado });
+    }
+
+    // 7) Criar cupom novo na loja (cupom de loja inteira, desconto percentual)
+    if (acao === 'criar_cupom') {
+      const { access_token, shop_id, nome, codigo, percentual, valor_minimo, desconto_maximo, quantidade, dias_validade } = params;
+      const agora = Math.floor(Date.now() / 1000);
+      const fim = agora + (Number(dias_validade || 180) * 86400);
+      const corpo = {
+        voucher_name: nome,
+        voucher_code: codigo,
+        start_time: agora,
+        end_time: fim,
+        voucher_type: 1, // cupom de loja inteira
+        reward_type: 2, // percentual
+        percentage: Number(percentual),
+        max_price: Number(desconto_maximo || 999999),
+        min_basket_price: Number(valor_minimo || 0),
+        usage_quantity: Number(quantidade || 5000)
+      };
+      const resultado = await chamarShopee('/api/v2/voucher/add_voucher', {}, 'POST', corpo);
+      return res.status(200).json({ ok: true, ...resultado });
+    }
+
     return res.status(400).json({ erro: 'Ação não reconhecida.' });
   } catch (e) {
     console.error(e);
