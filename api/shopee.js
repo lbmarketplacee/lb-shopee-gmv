@@ -228,6 +228,99 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, ...resultado });
     }
 
+    // 8) Criar Oferta Relâmpago — 100% automática, respeitando as regras da loja
+    //    Até "limite_produtos" produtos, "qtd_por_produto" unidades cada, desconto de "percentual"% sobre o preço atual
+    if (acao === 'criar_oferta_relampago') {
+      const { access_token, shop_id } = params;
+      const percentual = Number(params.percentual || 5);
+      const qtdPorProduto = Number(params.qtd_por_produto || 5);
+      const limiteProdutos = Math.min(Number(params.limite_produtos || 20), 20); // Shopee também limita 20 por oferta
+
+      // Passo A: buscar os produtos ativos da loja (até o limite)
+      const listaProdutos = await chamarShopee('/api/v2/product/get_item_list', {
+        access_token, shop_id,
+        offset: 0, page_size: limiteProdutos,
+        item_status: 'NORMAL'
+      }, 'GET', null, 'mkt');
+      const itens = listaProdutos?.response?.item || [];
+      if (!itens.length) {
+        return res.status(200).json({ ok: false, erro: 'Nenhum produto ativo encontrado na loja.', debugListaProdutos: listaProdutos });
+      }
+      const itemIds = itens.map(i => i.item_id);
+
+      // Passo B: buscar preço e info de cada produto (inclui se tem variação/modelo)
+      const infoProdutos = await chamarShopee('/api/v2/product/get_item_base_info', {
+        access_token, shop_id,
+        item_id_list: itemIds.join(',')
+      }, 'GET', null, 'mkt');
+      const detalhes = infoProdutos?.response?.item_list || [];
+
+      // Passo C: montar a lista de itens com preço promocional (produto por produto, modelo por modelo)
+      const itensParaOferta = [];
+      for (const item of detalhes) {
+        const precoAtual = item?.price_info?.[0]?.current_price;
+        if (item.has_model) {
+          // Produto com variação (cor/tamanho) — busca o preço de cada modelo separadamente
+          const modelos = await chamarShopee('/api/v2/product/get_model_list', {
+            access_token, shop_id, item_id: item.item_id
+          }, 'GET', null, 'mkt');
+          const listaModelos = modelos?.response?.model || [];
+          const models = listaModelos.map(m => {
+            const preco = m?.price_info?.[0]?.current_price || precoAtual || 0;
+            return {
+              model_id: m.model_id,
+              input_promo_price: Math.round((preco * (1 - percentual / 100)) * 100) / 100,
+              stock: qtdPorProduto
+            };
+          }).filter(m => m.input_promo_price > 0);
+          if (models.length) itensParaOferta.push({ item_id: item.item_id, purchase_limit: qtdPorProduto, models });
+        } else if (precoAtual) {
+          // Produto simples, sem variação
+          itensParaOferta.push({
+            item_id: item.item_id,
+            purchase_limit: qtdPorProduto,
+            models: [{ model_id: 0, input_promo_price: Math.round((precoAtual * (1 - percentual / 100)) * 100) / 100, stock: qtdPorProduto }]
+          });
+        }
+      }
+
+      if (!itensParaOferta.length) {
+        return res.status(200).json({ ok: false, erro: 'Não foi possível calcular preço promocional para nenhum produto.', debugDetalhes: detalhes });
+      }
+
+      // Passo D: pegar um horário disponível pra oferta
+      const agora = Math.floor(Date.now() / 1000);
+      const daqui7dias = agora + 7 * 24 * 60 * 60;
+      const horarios = await chamarShopee('/api/v2/shop_flash_sale/get_time_slot_id', {
+        access_token, shop_id, start_time: agora, end_time: daqui7dias
+      }, 'GET', null, 'mkt');
+      const proximoSlot = horarios?.response?.[0]?.timeslot_id;
+      if (!proximoSlot) {
+        return res.status(200).json({ ok: false, erro: 'Nenhum horário disponível encontrado na Shopee pros próximos 7 dias.', debugHorarios: horarios });
+      }
+
+      // Passo E: criar a "casca" da oferta relâmpago nesse horário
+      const criacao = await chamarShopee('/api/v2/shop_flash_sale/create_shop_flash_sale', {
+        access_token, shop_id
+      }, 'POST', { timeslot_id: proximoSlot }, 'mkt');
+      const flashSaleId = criacao?.response?.flash_sale_id;
+      if (!flashSaleId) {
+        return res.status(200).json({ ok: false, erro: 'Não foi possível criar a oferta relâmpago.', debugCriacao: criacao });
+      }
+
+      // Passo F: adicionar os produtos com o preço promocional
+      const adicaoItens = await chamarShopee('/api/v2/shop_flash_sale/add_shop_flash_sale_items', {
+        access_token, shop_id
+      }, 'POST', { flash_sale_id: flashSaleId, items: itensParaOferta }, 'mkt');
+
+      return res.status(200).json({
+        ok: true,
+        flash_sale_id: flashSaleId,
+        total_produtos: itensParaOferta.length,
+        resultado_itens: adicaoItens
+      });
+    }
+
     return res.status(400).json({ erro: 'Ação não reconhecida.' });
   } catch (e) {
     console.error(e);
