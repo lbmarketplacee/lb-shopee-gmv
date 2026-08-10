@@ -141,17 +141,20 @@ export default async function handler(req, res) {
             page_size: 20, cursor: ''
           }, 'GET', null, 'gmv');
         }
+        // Busca TODOS os pedidos do período (sem filtro de status) — GMV conta toda venda válida,
+        // não só a 100% "concluída" (que só acontece dias depois, quando o comprador confirma o recebimento).
+        // Excluímos manualmente só os que não são venda de verdade: cancelados e não pagos.
+        const STATUS_EXCLUIR = ['CANCELLED', 'UNPAID', 'INVOICE_PENDING'];
         let cursor = '', paginas = 0;
         do {
           const resultado = await chamarShopee('/api/v2/order/get_order_list', {
             access_token, shop_id,
             time_range_field: 'create_time',
             time_from: timeFrom, time_to: timeTo,
-            page_size: 100, cursor,
-            order_status: 'COMPLETED'
+            page_size: 100, cursor
           }, 'GET', null, 'gmv');
           const lista = resultado?.response?.order_list || [];
-          todosOrderSn.push(...lista.map(o => o.order_sn));
+          lista.forEach(o => { if (!STATUS_EXCLUIR.includes(o.order_status)) todosOrderSn.push(o.order_sn); });
           cursor = resultado?.response?.next_cursor || '';
           paginas++;
           if (paginas > 30) break;
