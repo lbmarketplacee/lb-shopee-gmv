@@ -255,10 +255,31 @@ export default async function handler(req, res) {
       }, 'GET', null, 'mkt');
       const detalhes = infoProdutos?.response?.item_list || [];
 
+      // Passo B.2: buscar o DESCONTO FIXO DA LOJA ativo (o preço "de verdade" já reduzido do preço de cadastro).
+      // A oferta relâmpago precisa calcular os 5% em cima DESSE preço, não do preço de cadastro cheio.
+      const mapaDescontoAtivo = {}; // item_id -> preço já com desconto fixo aplicado
+      try {
+        const listaDescontos = await chamarShopee('/api/v2/discount/get_discount_list', {
+          access_token, shop_id, discount_status: 'ongoing', page_size: 100
+        }, 'GET', null, 'mkt');
+        const descontos = listaDescontos?.response?.discount_list || [];
+        for (const desc of descontos) {
+          const detalheDesconto = await chamarShopee('/api/v2/discount/get_discount', {
+            access_token, shop_id, discount_id: desc.discount_id
+          }, 'GET', null, 'mkt');
+          const itensDesconto = detalheDesconto?.response?.item_list || [];
+          itensDesconto.forEach(di => {
+            const precoComDesconto = di?.model_list?.[0]?.discount_price ?? di?.item_promotion_price;
+            if (precoComDesconto) mapaDescontoAtivo[di.item_id] = precoComDesconto;
+          });
+        }
+      } catch (e) { /* se der erro buscando desconto, seguimos com o preço normal como fallback */ }
+
       // Passo C: montar a lista de itens com preço promocional (produto por produto, modelo por modelo)
       const itensParaOferta = [];
       for (const item of detalhes) {
-        const precoAtual = item?.price_info?.[0]?.current_price;
+        // Prioridade: preço do desconto fixo ativo > preço atual do produto (fallback)
+        const precoAtual = mapaDescontoAtivo[item.item_id] ?? item?.price_info?.[0]?.current_price;
         if (item.has_model) {
           // Produto com variação (cor/tamanho) — busca o preço de cada modelo separadamente
           const modelos = await chamarShopee('/api/v2/product/get_model_list', {
