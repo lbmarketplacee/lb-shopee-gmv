@@ -133,7 +133,6 @@ export default async function handler(req, res) {
       let todosOrderSn = [];
       let primeiraRespostaBruta = null;
       for (const [timeFrom, timeTo] of janelas) {
-        // Diagnóstico (só na primeira janela, pra não gastar chamada à toa)
         if (!primeiraRespostaBruta) {
           primeiraRespostaBruta = await chamarShopee('/api/v2/order/get_order_list', {
             access_token, shop_id,
@@ -142,7 +141,6 @@ export default async function handler(req, res) {
             page_size: 20, cursor: ''
           }, 'GET', null, 'gmv');
         }
-        // Busca de verdade, só os concluídos, paginando dentro dessa janela de 15 dias
         let cursor = '', paginas = 0;
         do {
           const resultado = await chamarShopee('/api/v2/order/get_order_list', {
@@ -166,7 +164,6 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true, gmv: 0, totalPedidos: 0, debug });
       }
 
-      // Passo C: busca o VALOR de cada pedido (get_order_detail aceita até 50 por chamada)
       let gmvTotal = 0;
       let ultimoDetalheResposta = null;
       for (let i = 0; i < todosOrderSn.length; i += 50) {
