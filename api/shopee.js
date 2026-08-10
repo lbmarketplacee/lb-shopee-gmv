@@ -217,7 +217,9 @@ export default async function handler(req, res) {
         percentage: Number(percentual),
         max_price: Number(desconto_maximo || 999999),
         min_basket_price: Number(valor_minimo || 0),
-        usage_quantity: Number(quantidade || 5000)
+        usage_quantity: Number(quantidade || 5000),
+        display_channel_list: [1], // 1 = mostrar pra todo mundo na loja (público, sem precisar do código)
+        display_start_time: agora
       };
       const resultado = await chamarShopee('/api/v2/voucher/add_voucher', { access_token, shop_id }, 'POST', corpo, 'mkt');
       return res.status(200).json({ ok: true, ...resultado });
