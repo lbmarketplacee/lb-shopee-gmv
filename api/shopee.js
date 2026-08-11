@@ -244,7 +244,8 @@ export default async function handler(req, res) {
       }, 'GET', null, 'mkt');
       const itens = listaProdutos?.response?.item || [];
       if (!itens.length) {
-        return res.status(200).json({ ok: false, erro: 'Nenhum produto ativo encontrado na loja.', debugListaProdutos: listaProdutos });
+        const erroReal = listaProdutos?.error ? `${listaProdutos.error}: ${listaProdutos.message || ''}` : 'Nenhum produto ativo encontrado na loja (ou erro desconhecido).';
+        return res.status(200).json({ ok: false, erro: erroReal, debugListaProdutos: listaProdutos });
       }
       const itemIds = itens.map(i => i.item_id);
 
@@ -309,15 +310,26 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: false, erro: 'Não foi possível calcular preço promocional para nenhum produto.', debugDetalhes: detalhes });
       }
 
-      // Passo D: pegar um horário disponível pra oferta
-      const agora = Math.floor(Date.now() / 1000);
+      // Passo D.1: verificar se a loja JÁ TEM oferta relâmpago ativa/agendada — se tiver, a nova
+      // precisa começar DEPOIS que a(s) existente(s) terminar(em), pra não dar conflito.
+      let agora = Math.floor(Date.now() / 1000);
+      try {
+        const ofertasExistentes = await chamarShopee('/api/v2/shop_flash_sale/get_shop_flash_sale_list', {
+          access_token, shop_id, type: 1, // 1 = agendada/em andamento (upcoming + ongoing)
+          offset: 0, limit: 100
+        }, 'GET', null, 'mkt');
+        const listaExistentes = ofertasExistentes?.response?.flash_sale_list || [];
+        listaExistentes.forEach(f => { if (f.end_time && f.end_time > agora) agora = f.end_time + 60; }); // +1min de folga
+      } catch (e) { /* se der erro checando, segue a partir de agora mesmo */ }
+
+      // Passo D.2: pegar um horário disponível a partir desse ponto (depois do que já existe)
       const daqui7dias = agora + 7 * 24 * 60 * 60;
       const horarios = await chamarShopee('/api/v2/shop_flash_sale/get_time_slot_id', {
         access_token, shop_id, start_time: agora, end_time: daqui7dias
       }, 'GET', null, 'mkt');
       const proximoSlot = horarios?.response?.[0]?.timeslot_id;
       if (!proximoSlot) {
-        return res.status(200).json({ ok: false, erro: 'Nenhum horário disponível encontrado na Shopee pros próximos 7 dias.', debugHorarios: horarios });
+        return res.status(200).json({ ok: false, erro: 'Nenhum horário disponível encontrado na Shopee pros próximos 7 dias (considerando ofertas já ativas).', debugHorarios: horarios });
       }
 
       // Passo E: criar a "casca" da oferta relâmpago nesse horário
