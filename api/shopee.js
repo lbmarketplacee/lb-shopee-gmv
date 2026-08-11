@@ -231,17 +231,21 @@ export default async function handler(req, res) {
     // 8) Criar Oferta Relâmpago — 100% automática, respeitando as regras da loja
     //    Até "limite_produtos" produtos, "qtd_por_produto" unidades cada, desconto de "percentual"% sobre o preço atual
     if (acao === 'criar_oferta_relampago') {
-      const { access_token, shop_id } = params;
+      const { access_token, shop_id, access_token_gmv, shop_id_gmv } = params;
       const percentual = Number(params.percentual || 5);
       const qtdPorProduto = Number(params.qtd_por_produto || 5);
       const limiteProdutos = Math.min(Number(params.limite_produtos || 20), 20); // Shopee também limita 20 por oferta
 
-      // Passo A: buscar os produtos ativos da loja (até o limite)
+      if (!access_token_gmv || !shop_id_gmv) {
+        return res.status(200).json({ ok: false, erro: 'Essa loja também precisa estar conectada ao app GMV (a busca de produtos usa essas credenciais). Conecte o GMV primeiro.' });
+      }
+
+      // Passo A: buscar os produtos ativos da loja (até o limite) — usa o token do app GMV, que tem acesso a catálogo
       const listaProdutos = await chamarShopee('/api/v2/product/get_item_list', {
-        access_token, shop_id,
+        access_token: access_token_gmv, shop_id: shop_id_gmv,
         offset: 0, page_size: limiteProdutos,
         item_status: 'NORMAL'
-      }, 'GET', null, 'mkt');
+      }, 'GET', null, 'gmv');
       const itens = listaProdutos?.response?.item || [];
       if (!itens.length) {
         const erroReal = listaProdutos?.error ? `${listaProdutos.error}: ${listaProdutos.message || ''}` : 'Nenhum produto ativo encontrado na loja (ou erro desconhecido).';
@@ -251,9 +255,9 @@ export default async function handler(req, res) {
 
       // Passo B: buscar preço e info de cada produto (inclui se tem variação/modelo)
       const infoProdutos = await chamarShopee('/api/v2/product/get_item_base_info', {
-        access_token, shop_id,
+        access_token: access_token_gmv, shop_id: shop_id_gmv,
         item_id_list: itemIds.join(',')
-      }, 'GET', null, 'mkt');
+      }, 'GET', null, 'gmv');
       const detalhes = infoProdutos?.response?.item_list || [];
 
       // Passo B.2: buscar o DESCONTO FIXO DA LOJA ativo (o preço "de verdade" já reduzido do preço de cadastro).
@@ -284,8 +288,8 @@ export default async function handler(req, res) {
         if (item.has_model) {
           // Produto com variação (cor/tamanho) — busca o preço de cada modelo separadamente
           const modelos = await chamarShopee('/api/v2/product/get_model_list', {
-            access_token, shop_id, item_id: item.item_id
-          }, 'GET', null, 'mkt');
+            access_token: access_token_gmv, shop_id: shop_id_gmv, item_id: item.item_id
+          }, 'GET', null, 'gmv');
           const listaModelos = modelos?.response?.model || [];
           const models = listaModelos.map(m => {
             const preco = m?.price_info?.[0]?.current_price || precoAtual || 0;
