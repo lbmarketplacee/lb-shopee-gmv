@@ -167,20 +167,29 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true, gmv: 0, totalPedidos: 0, debug });
       }
 
+      // Monta todos os lotes de 50 pedidos e busca TODOS EM PARALELO (em vez de um de cada vez),
+      // pra lojas com muitos pedidos não estourarem o tempo máximo da função.
       let gmvTotal = 0;
       let ultimoDetalheResposta = null;
-      for (let i = 0; i < todosOrderSn.length; i += 50) {
-        const lote = todosOrderSn.slice(i, i + 50);
-        const detalhe = await chamarShopee('/api/v2/order/get_order_detail', {
+      const lotes = [];
+      for (let i = 0; i < todosOrderSn.length; i += 50) lotes.push(todosOrderSn.slice(i, i + 50));
+
+      const LIMITE_PARALELO = 8; // no máximo 8 chamadas ao mesmo tempo, pra não sobrecarregar
+      for (let i = 0; i < lotes.length; i += LIMITE_PARALELO) {
+        const grupo = lotes.slice(i, i + LIMITE_PARALELO);
+        const respostas = await Promise.all(grupo.map(lote => chamarShopee('/api/v2/order/get_order_detail', {
           access_token, shop_id,
           order_sn_list: lote.join(','),
           response_optional_fields: 'total_amount'
-        }, 'GET', null, 'gmv');
-        ultimoDetalheResposta = detalhe;
-        const pedidos = detalhe?.response?.order_list || [];
-        pedidos.forEach(p => { gmvTotal += Number(p.total_amount) || 0; });
+        }, 'GET', null, 'gmv')));
+        respostas.forEach(detalhe => {
+          ultimoDetalheResposta = detalhe;
+          const pedidos = detalhe?.response?.order_list || [];
+          pedidos.forEach(p => { gmvTotal += Number(p.total_amount) || 0; });
+        });
       }
       debug.ultimoDetalheResposta = ultimoDetalheResposta;
+      debug.totalLotes = lotes.length;
 
       return res.status(200).json({ ok: true, gmv: gmvTotal, totalPedidos: todosOrderSn.length, debug });
     }
