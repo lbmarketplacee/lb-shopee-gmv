@@ -24,7 +24,7 @@ function gerarAssinatura(path, timestamp, partnerId, partnerKey, accessToken='',
 
 // app: 'gmv' (padrão) ou 'mkt' — escolhe qual par de credenciais usar
 function getConfig(app = 'gmv'){
-  const prefixo = app === 'mkt' ? 'SHOPEE_MKT_' : 'SHOPEE_';
+  const prefixo = app === 'mkt' ? 'SHOPEE_MKT_' : app === 'ads' ? 'SHOPEE_ADS_' : 'SHOPEE_';
   return {
     app,
     partnerId: limpar(process.env[`${prefixo}PARTNER_ID`]),
@@ -68,19 +68,21 @@ export default async function handler(req, res) {
     const { acao } = params;
     // Qual app usar nesta chamada: o front manda "app" = 'gmv' ou 'mkt'.
     // Se não mandar nada, cai no 'gmv' (mantém compatibilidade com o que já existe).
-    const appEscolhido = (params.app === 'mkt') ? 'mkt' : 'gmv';
+    const appEscolhido = (params.app === 'mkt' || params.app === 'ads') ? params.app : 'gmv';
     const { partnerId, partnerKey, ambiente, quotaguardUrl } = getConfig(appEscolhido);
 
     // 0) Diagnóstico — nunca expõe a chave, só confirma tamanho/formato
     if (acao === 'diagnostico') {
       const gmv = getConfig('gmv');
       const mkt = getConfig('mkt');
+      const ads = getConfig('ads');
       return res.status(200).json({
         ok: true,
         ambiente,
         quotaguard_configurado: !!quotaguardUrl,
         gmv: { partner_id_valor: gmv.partnerId, partner_id_tamanho: gmv.partnerId.length, partner_key_tamanho: gmv.partnerKey.length },
-        mkt: { partner_id_valor: mkt.partnerId, partner_id_tamanho: mkt.partnerId.length, partner_key_tamanho: mkt.partnerKey.length }
+        mkt: { partner_id_valor: mkt.partnerId, partner_id_tamanho: mkt.partnerId.length, partner_key_tamanho: mkt.partnerKey.length },
+        ads: { partner_id_valor: ads.partnerId, partner_id_tamanho: ads.partnerId.length, partner_key_tamanho: ads.partnerKey.length }
       });
     }
 
@@ -365,6 +367,18 @@ export default async function handler(req, res) {
         total_produtos: itensParaOferta.length,
         resultado_itens: adicaoItens
       });
+    }
+
+    // 9) Saldo do Shopee Ads (app Ads)
+    if (acao === 'saldo_ads') {
+      const { access_token, shop_id } = params;
+      const resultado = await chamarShopee('/api/v2/ads/get_total_balance', {
+        access_token, shop_id
+      }, 'GET', null, 'ads');
+      if (resultado?.error) {
+        return res.status(200).json({ ok: false, erro: `${resultado.error}: ${resultado.message || ''}`, debug: resultado });
+      }
+      return res.status(200).json({ ok: true, saldo: resultado?.response?.total_balance ?? 0, debug: resultado });
     }
 
     return res.status(400).json({ erro: 'Ação não reconhecida.' });
