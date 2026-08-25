@@ -1,16 +1,13 @@
 {
-  "crons": [
-    {
-      "path": "/api/atualizar-gmv-cron",
-      "schedule": "0 10 * * 1"
-    }
-  ],
   "functions": {
     "api/shopee.js": {
       "maxDuration": 60
     },
     "api/atualizar-gmv-cron.js": {
       "maxDuration": 60
+    },
+    "api/historico-diario-cron.js": {
+      "maxDuration": 30
     }
   }
 }
