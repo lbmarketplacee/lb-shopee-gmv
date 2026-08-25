@@ -242,6 +242,7 @@ export default async function handler(req, res) {
     // 8) Criar Oferta Relâmpago — 100% automática, respeitando as regras da loja
     //    Até "limite_produtos" produtos, "qtd_por_produto" unidades cada, desconto de "percentual"% sobre o preço atual
     if (acao === 'criar_oferta_relampago') {
+      return res.status(200).json({ ok: false, erro: 'Função pausada temporariamente pra economizar banda do QuotaGuard. Fala com o Lincoln pra reativar.' });
       const { access_token, shop_id, access_token_gmv, shop_id_gmv } = params;
       const percentual = Number(params.percentual || 5);
       const qtdPorProduto = Number(params.qtd_por_produto || 5);
