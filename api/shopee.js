@@ -53,7 +53,15 @@ function chamarShopee(path, params = {}, metodo = 'GET', body = null, app = 'gmv
     url.searchParams.set('sign', sign);
     Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== '') url.searchParams.set(k, v); });
 
-    const agent = new HttpsProxyAgent(quotaguardUrl);
+    const proxyUrlObj = new URL(quotaguardUrl);
+    // Monta o cabeçalho Proxy-Authorization manualmente (Basic Auth) e passa direto pro agente —
+    // é ele quem faz o túnel CONNECT com o proxy, não confia só na extração automática da URL
+    const headersProxy = {};
+    if (proxyUrlObj.username || proxyUrlObj.password) {
+      const credencial = Buffer.from(`${decodeURIComponent(proxyUrlObj.username)}:${decodeURIComponent(proxyUrlObj.password)}`).toString('base64');
+      headersProxy['Proxy-Authorization'] = `Basic ${credencial}`;
+    }
+    const agent = new HttpsProxyAgent(quotaguardUrl, { headers: headersProxy });
     const corpo = body ? JSON.stringify(body) : null;
     const opts = {
       method: metodo,
