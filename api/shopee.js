@@ -8,7 +8,8 @@
 //     SHOPEE_AMBIENTE (sandbox|producao), QUOTAGUARD_URL
 
 import crypto from 'crypto';
-import { ProxyAgent, fetch as undiciFetch } from 'undici';
+import https from 'node:https';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
 const HOSTS = {
   sandbox: 'https://openplatform.sandbox.test-stable.shopee.sg',
@@ -34,27 +35,44 @@ function getConfig(app = 'gmv'){
   };
 }
 
-// Faz a chamada HTTP passando SEMPRE pelo proxy do QuotaGuard (IP fixo)
-async function chamarShopee(path, params = {}, metodo = 'GET', body = null, app = 'gmv'){
-  const { partnerId, partnerKey, ambiente, quotaguardUrl } = getConfig(app);
-  const host = HOSTS[ambiente];
-  if (!partnerId || !partnerKey) throw new Error(`Credenciais da Shopee (${app}) não configuradas.`);
-  if (!quotaguardUrl) throw new Error('QUOTAGUARD_URL não configurada.');
+// Faz a chamada HTTP passando SEMPRE pelo proxy fixo (IP fixo), usando https-proxy-agent
+// (o ProxyAgent do undici tem um bug conhecido com proxy autenticado + HTTPS — trocamos por essa lib)
+function chamarShopee(path, params = {}, metodo = 'GET', body = null, app = 'gmv'){
+  return new Promise((resolve, reject) => {
+    const { partnerId, partnerKey, ambiente, quotaguardUrl } = getConfig(app);
+    const host = HOSTS[ambiente];
+    if (!partnerId || !partnerKey) return reject(new Error(`Credenciais da Shopee (${app}) não configuradas.`));
+    if (!quotaguardUrl) return reject(new Error('QUOTAGUARD_URL não configurada.'));
 
-  const timestamp = Math.floor(Date.now() / 1000);
-  const sign = gerarAssinatura(path, timestamp, partnerId, partnerKey, params.access_token || '', params.shop_id || '');
+    const timestamp = Math.floor(Date.now() / 1000);
+    const sign = gerarAssinatura(path, timestamp, partnerId, partnerKey, params.access_token || '', params.shop_id || '');
 
-  const url = new URL(host + path);
-  url.searchParams.set('partner_id', partnerId);
-  url.searchParams.set('timestamp', timestamp);
-  url.searchParams.set('sign', sign);
-  Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== '') url.searchParams.set(k, v); });
+    const url = new URL(host + path);
+    url.searchParams.set('partner_id', partnerId);
+    url.searchParams.set('timestamp', timestamp);
+    url.searchParams.set('sign', sign);
+    Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== '') url.searchParams.set(k, v); });
 
-  const dispatcher = new ProxyAgent(quotaguardUrl);
-  const opts = { method: metodo, dispatcher };
-  if (body) { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
-  const resp = await undiciFetch(url.toString(), opts);
-  return await resp.json();
+    const agent = new HttpsProxyAgent(quotaguardUrl);
+    const corpo = body ? JSON.stringify(body) : null;
+    const opts = {
+      method: metodo,
+      agent,
+      headers: corpo ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(corpo) } : {}
+    };
+
+    const req = https.request(url, opts, (resp) => {
+      let dados = '';
+      resp.on('data', (chunk) => { dados += chunk; });
+      resp.on('end', () => {
+        try { resolve(JSON.parse(dados)); }
+        catch (e) { reject(new Error('Resposta inválida da Shopee: ' + dados.slice(0, 200))); }
+      });
+    });
+    req.on('error', reject);
+    if (corpo) req.write(corpo);
+    req.end();
+  });
 }
 
 export default async function handler(req, res) {
