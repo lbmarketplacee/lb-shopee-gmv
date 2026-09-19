@@ -25,7 +25,7 @@ function getConfig(app = 'gmv'){
     partnerId: limpar(process.env[`${prefixo}PARTNER_ID`]),
     partnerKey: limpar(process.env[`${prefixo}PARTNER_KEY`]),
     ambiente: limpar(process.env.SHOPEE_AMBIENTE) || 'sandbox',
-    quotaguardUrl: limpar(process.env.QUOTAGUARD_URL)
+    quotaguardUrl: limpar(process.env.FIXIE_URL)
   };
 }
 
