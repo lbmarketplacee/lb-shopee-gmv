@@ -5,7 +5,7 @@
 //   App Marketing (cupons/ofertas relâmpago):
 //     SHOPEE_MKT_PARTNER_ID, SHOPEE_MKT_PARTNER_KEY
 //   Comuns:
-//     SHOPEE_AMBIENTE (sandbox|producao), QUOTAGUARD_URL
+//     SHOPEE_AMBIENTE (sandbox|producao), FIXIE_URL
 
 import crypto from 'crypto';
 import https from 'node:https';
@@ -31,7 +31,7 @@ function getConfig(app = 'gmv'){
     partnerId: limpar(process.env[`${prefixo}PARTNER_ID`]),
     partnerKey: limpar(process.env[`${prefixo}PARTNER_KEY`]),
     ambiente: limpar(process.env.SHOPEE_AMBIENTE) || 'sandbox',
-    quotaguardUrl: limpar(process.env.QUOTAGUARD_URL)
+    quotaguardUrl: limpar(process.env.FIXIE_URL)
   };
 }
 
@@ -42,7 +42,7 @@ function chamarShopee(path, params = {}, metodo = 'GET', body = null, app = 'gmv
     const { partnerId, partnerKey, ambiente, quotaguardUrl } = getConfig(app);
     const host = HOSTS[ambiente];
     if (!partnerId || !partnerKey) return reject(new Error(`Credenciais da Shopee (${app}) não configuradas.`));
-    if (!quotaguardUrl) return reject(new Error('QUOTAGUARD_URL não configurada.'));
+    if (!quotaguardUrl) return reject(new Error('FIXIE_URL não configurada.'));
 
     const timestamp = Math.floor(Date.now() / 1000);
     const sign = gerarAssinatura(path, timestamp, partnerId, partnerKey, params.access_token || '', params.shop_id || '');
