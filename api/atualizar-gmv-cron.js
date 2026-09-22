@@ -43,8 +43,10 @@ async function chamarShopee(path, params = {}, metodo = 'GET', body = null, app 
   const opts = { method: metodo, dispatcher };
   if (body) { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
   const resp = await undiciFetch(url.toString(), opts);
+  CONTADOR_CHAMADAS_SHOPEE++; // conta toda chamada real à Shopee (GMV, token, Marketing/desconto — tudo passa por aqui)
   return await resp.json();
 }
+let CONTADOR_CHAMADAS_SHOPEE = 0;
 
 // Inicializa o Firebase Admin (reaproveita a mesma chave de serviço já usada no lb-cadastro-api)
 function getDb(){
@@ -170,9 +172,11 @@ async function renovarDescontoFixo(accessToken, shopId, db, clienteId){
   return { renovado: true, novoDiscountId, novoInicio, novoFim, totalProdutos: itensParaAdicionar.length, debugAdicaoItens: adicaoItens };
 }
 
-async function buscarGmvCliente(accessToken, shopId, dataInicio, dataFim){
-  const timeFromTotal = Math.floor(new Date(dataInicio).getTime() / 1000);
-  const timeToTotal = Math.floor(new Date(dataFim).getTime() / 1000);
+// Busca pedidos no período pedido e retorna o GMV JÁ SEPARADO POR DIA (create_time),
+// pra dar pra salvar cada dia individualmente no Firestore (gmvDiario).
+async function buscarGmvPorDia(accessToken, shopId, dataInicio, dataFim){
+  const timeFromTotal = Math.floor(new Date(dataInicio + 'T00:00:00Z').getTime() / 1000);
+  const timeToTotal = Math.floor(new Date(dataFim + 'T23:59:59Z').getTime() / 1000);
   const QUINZE_DIAS = 15 * 24 * 60 * 60;
   const janelas = [];
   let inicioJanela = timeFromTotal;
@@ -181,6 +185,7 @@ async function buscarGmvCliente(accessToken, shopId, dataInicio, dataFim){
     janelas.push([inicioJanela, fimJanela]);
     inicioJanela = fimJanela + 1;
   }
+  // Mesma regra de exclusão de sempre — não mudou.
   const STATUS_EXCLUIR = ['CANCELLED', 'UNPAID', 'INVOICE_PENDING'];
   let todosOrderSn = [];
   for (const [timeFrom, timeTo] of janelas) {
@@ -199,19 +204,96 @@ async function buscarGmvCliente(accessToken, shopId, dataInicio, dataFim){
       if (paginas > 30) break;
     } while (cursor);
   }
-  if (!todosOrderSn.length) return { gmv: 0, totalPedidos: 0 };
-  let gmvTotal = 0;
+
+  const porDia = {}; // { 'AAAA-MM-DD': { valor, totalPedidos } }
+  // Pré-preenche TODOS os dias do período pedido com zero — garante que um dia que
+  // tinha GMV antes e agora não tem mais pedidos válidos (cancelados, etc.) seja
+  // sobrescrito com 0 no Firestore, em vez de manter o valor antigo (stale).
+  {
+    let cursorDia = new Date(dataInicio + 'T00:00:00Z');
+    const fimDia = new Date(dataFim + 'T00:00:00Z');
+    while (cursorDia <= fimDia) {
+      porDia[cursorDia.toISOString().split('T')[0]] = { valor: 0, totalPedidos: 0 };
+      cursorDia = new Date(cursorDia.getTime() + 24 * 60 * 60 * 1000);
+    }
+  }
+  if (!todosOrderSn.length) return { porDia, totalPedidos: 0 };
+
+  // Pede também o create_time no detalhe, pra saber em qual dia cada pedido entra.
   for (let i = 0; i < todosOrderSn.length; i += 50) {
     const lote = todosOrderSn.slice(i, i + 50);
     const detalhe = await chamarShopee('/api/v2/order/get_order_detail', {
       access_token: accessToken, shop_id: shopId,
       order_sn_list: lote.join(','),
-      response_optional_fields: 'total_amount'
+      response_optional_fields: 'total_amount,create_time'
     }, 'GET', null, 'gmv');
     const pedidos = detalhe?.response?.order_list || [];
-    pedidos.forEach(p => { gmvTotal += Number(p.total_amount) || 0; });
+    pedidos.forEach(p => {
+      const dia = new Date((p.create_time || 0) * 1000).toISOString().split('T')[0];
+      if (!porDia[dia]) porDia[dia] = { valor: 0, totalPedidos: 0 };
+      porDia[dia].valor += Number(p.total_amount) || 0;
+      porDia[dia].totalPedidos += 1;
+    });
   }
-  return { gmv: gmvTotal, totalPedidos: todosOrderSn.length };
+  return { porDia, totalPedidos: todosOrderSn.length };
+}
+
+function fmtDia(d){ return d.toISOString().split('T')[0]; }
+
+// Verifica se o cliente já tem histórico diário salvo (decide PRIMEIRA_CARGA x INCREMENTAL)
+async function temHistoricoDiario(db, clienteId){
+  const snap = await db.collection('clientes').doc(clienteId).collection('gmvDiario').limit(1).get();
+  return !snap.empty;
+}
+
+// Grava/sobrescreve os dias calculados nessa execução (só os dias que vieram no "porDia")
+async function salvarDiasNoFirestore(db, clienteId, porDia){
+  const dias = Object.entries(porDia);
+  if (!dias.length) return;
+  const batch = db.batch();
+  dias.forEach(([dia, dados]) => {
+    const ref = db.collection('clientes').doc(clienteId).collection('gmvDiario').doc(dia);
+    batch.set(ref, { valor: dados.valor, totalPedidos: dados.totalPedidos, atualizadoEm: new Date() });
+  });
+  await batch.commit();
+}
+
+// Soma os dias já salvos que caem dentro da janela móvel de 30 dias — sem chamar a Shopee.
+async function somarUltimos30Dias(db, clienteId, hoje){
+  const snap = await db.collection('clientes').doc(clienteId).collection('gmvDiario').get();
+  const limiteInicio = fmtDia(new Date(hoje.getTime() - 29 * 24 * 60 * 60 * 1000));
+  const hojeStr = fmtDia(hoje);
+  let gmv = 0, totalPedidos = 0;
+  snap.docs.forEach(d => {
+    if (d.id >= limiteInicio && d.id <= hojeStr) {
+      const data = d.data();
+      gmv += Number(data.valor) || 0;
+      totalPedidos += Number(data.totalPedidos) || 0;
+    }
+  });
+  return { gmv, totalPedidos };
+}
+
+// ---- Lock pra impedir duas execuções simultâneas do cron ----
+const LOCK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutos
+
+async function adquirirLock(db){
+  const ref = db.collection('configuracoes').doc('cronGmvLock');
+  const snap = await ref.get();
+  if (snap.exists) {
+    const data = snap.data();
+    const iniciadoEmMs = data.iniciadoEm?.toMillis ? data.iniciadoEm.toMillis() : (data.iniciadoEm ? new Date(data.iniciadoEm).getTime() : 0);
+    if (data.emExecucao && (Date.now() - iniciadoEmMs) < LOCK_TIMEOUT_MS) {
+      return false; // trava ativa e recente — outra execução já está rodando, aborta
+    }
+    // trava existe mas está "abandonada" (mais de 10min) — assume a execução mesmo assim
+  }
+  await ref.set({ emExecucao: true, iniciadoEm: new Date() });
+  return true;
+}
+
+async function liberarLock(db){
+  await db.collection('configuracoes').doc('cronGmvLock').set({ emExecucao: false, iniciadoEm: new Date() });
 }
 
 export default async function handler(req, res) {
@@ -222,40 +304,87 @@ export default async function handler(req, res) {
   }
 
   const db = getDb();
-  const hoje = new Date();
-  const trintaDiasAtras = new Date(hoje.getTime() - 29 * 24 * 60 * 60 * 1000);
-  const dataInicio = trintaDiasAtras.toISOString().split('T')[0];
-  const dataFim = hoje.toISOString().split('T')[0];
 
-  const snapshot = await db.collection('clientes').where('shopeeShopId', '!=', null).get();
-  const resultados = [];
-
-  for (const docSnap of snapshot.docs) {
-    const cliente = { id: docSnap.id, ...docSnap.data() };
-    if (!cliente.shopeeShopId) continue;
-    try {
-      const accessToken = await garantirTokenValido(db, cliente);
-      const { gmv, totalPedidos } = await buscarGmvCliente(accessToken, cliente.shopeeShopId, dataInicio, dataFim);
-      await db.collection('clientes').doc(cliente.id).update({
-        gmvShopeeAutomatico: gmv,
-        gmvShopeeAtualizadoEm: new Date()
-      });
-      resultados.push({ cliente: cliente.nome, gmv, totalPedidos, ok: true });
-    } catch (e) {
-      resultados.push({ cliente: cliente.nome, erro: e.message, ok: false });
-    }
-
-    // Se esse cliente também está conectado ao app Marketing, confere e renova o desconto fixo se precisar
-    if (cliente.shopeeMktShopId) {
-      try {
-        const accessTokenMkt = await garantirTokenValidoMkt(db, cliente);
-        const resultadoDesconto = await renovarDescontoFixo(accessTokenMkt, cliente.shopeeMktShopId, db, cliente.id);
-        resultados.push({ cliente: cliente.nome, tipo: 'desconto_fixo', ...resultadoDesconto, ok: true });
-      } catch (e) {
-        resultados.push({ cliente: cliente.nome, tipo: 'desconto_fixo', erro: e.message, ok: false });
-      }
-    }
+  const lockOk = await adquirirLock(db);
+  if (!lockOk) {
+    console.log('[GMV CRON] Abortado — já existe uma execução em andamento (lock ativo há menos de 10min).');
+    return res.status(200).json({ ok: false, erro: 'Já existe uma execução em andamento (lock ativo).' });
   }
 
-  return res.status(200).json({ ok: true, executadoEm: new Date().toISOString(), resultados });
+  try {
+    CONTADOR_CHAMADAS_SHOPEE = 0;
+    const hoje = new Date();
+    const hojeStr = fmtDia(hoje);
+    const MARGEM_DIAS = 7;
+    const inicioMargem = fmtDia(new Date(hoje.getTime() - (MARGEM_DIAS - 1) * 24 * 60 * 60 * 1000));
+    const inicioHistoricoCompleto = fmtDia(new Date(hoje.getTime() - 29 * 24 * 60 * 60 * 1000));
+
+    const snapshot = await db.collection('clientes').where('shopeeShopId', '!=', null).get();
+    const resultados = [];
+    let totalErros = 0;
+
+    for (const docSnap of snapshot.docs) {
+      const cliente = { id: docSnap.id, ...docSnap.data() };
+      if (!cliente.shopeeShopId) continue;
+
+      try {
+        const temHistorico = await temHistoricoDiario(db, cliente.id);
+        const modo = temHistorico ? 'INCREMENTAL' : 'PRIMEIRA_CARGA';
+        const periodoInicio = temHistorico ? inicioMargem : inicioHistoricoCompleto;
+
+        const accessToken = await garantirTokenValido(db, cliente);
+
+        // Busca e calcula ANTES de gravar qualquer coisa — se der erro aqui, nada é sobrescrito.
+        const { porDia, totalPedidos } = await buscarGmvPorDia(accessToken, cliente.shopeeShopId, periodoInicio, hojeStr);
+
+        await salvarDiasNoFirestore(db, cliente.id, porDia);
+        const { gmv: gmvFinal, totalPedidos: totalPedidosFinal } = await somarUltimos30Dias(db, cliente.id, hoje);
+
+        // Únicos campos que o frontend lê — continuam exatamente com o mesmo nome/formato de sempre.
+        await db.collection('clientes').doc(cliente.id).update({
+          gmvShopeeAutomatico: gmvFinal,
+          gmvShopeeAtualizadoEm: new Date()
+        });
+
+        const gmvPeriodo = Object.values(porDia).reduce((s, d) => s + d.valor, 0);
+        console.log(
+          `[GMV CRON] CLIENTE: ${cliente.nome} | MODO: ${modo} | PERIODO: ${periodoInicio} a ${hojeStr} | ` +
+          `PEDIDOS ENCONTRADOS: ${totalPedidos} | GMV CALCULADO (periodo): ${gmvPeriodo.toFixed(2)} | ` +
+          `GMV FINAL 30 DIAS: ${gmvFinal.toFixed(2)}`
+        );
+
+        resultados.push({ cliente: cliente.nome, modo, ok: true, gmv: gmvFinal, totalPedidos: totalPedidosFinal });
+      } catch (e) {
+        totalErros++;
+        console.error(`[GMV CRON] ERRO — CLIENTE: ${cliente.nome} | ${e.message}`);
+        resultados.push({ cliente: cliente.nome, erro: e.message, ok: false });
+        // Não apaga gmvDiario, não zera gmvShopeeAutomatico — o último valor válido continua no ar.
+      }
+
+      // Marketing / desconto fixo — lógica ORIGINAL, 100% intocada
+      if (cliente.shopeeMktShopId) {
+        try {
+          const accessTokenMkt = await garantirTokenValidoMkt(db, cliente);
+          const resultadoDesconto = await renovarDescontoFixo(accessTokenMkt, cliente.shopeeMktShopId, db, cliente.id);
+          resultados.push({ cliente: cliente.nome, tipo: 'desconto_fixo', ...resultadoDesconto, ok: true });
+        } catch (e) {
+          resultados.push({ cliente: cliente.nome, tipo: 'desconto_fixo', erro: e.message, ok: false });
+        }
+      }
+    }
+
+    console.log(`[GMV CRON] TOTAL CLIENTES: ${snapshot.docs.length} | TOTAL CHAMADAS SHOPEE: ${CONTADOR_CHAMADAS_SHOPEE} | TOTAL ERROS: ${totalErros}`);
+
+    return res.status(200).json({
+      ok: true,
+      executadoEm: new Date().toISOString(),
+      totalClientes: snapshot.docs.length,
+      totalChamadasShopee: CONTADOR_CHAMADAS_SHOPEE,
+      totalErros,
+      resultados
+    });
+  } finally {
+    // Libera SEMPRE — sucesso ou erro — pra nunca travar o cron permanentemente.
+    await liberarLock(db);
+  }
 }
