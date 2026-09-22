@@ -159,16 +159,7 @@ export default async function handler(req, res) {
       }
 
       let todosOrderSn = [];
-      let primeiraRespostaBruta = null;
       for (const [timeFrom, timeTo] of janelas) {
-        if (!primeiraRespostaBruta) {
-          primeiraRespostaBruta = await chamarShopee('/api/v2/order/get_order_list', {
-            access_token, shop_id,
-            time_range_field: 'create_time',
-            time_from: timeFrom, time_to: timeTo,
-            page_size: 20, cursor: ''
-          }, 'GET', null, 'gmv');
-        }
         // Busca TODOS os pedidos do período (sem filtro de status) — GMV conta toda venda válida,
         // não só a 100% "concluída" (que só acontece dias depois, quando o comprador confirma o recebimento).
         // Excluímos manualmente só os que não são venda de verdade: cancelados e não pagos.
@@ -189,7 +180,6 @@ export default async function handler(req, res) {
         } while (cursor);
         debug.janelas.push({ timeFrom, timeTo });
       }
-      debug.respostaListaBruta = primeiraRespostaBruta;
 
       if (!todosOrderSn.length) {
         return res.status(200).json({ ok: true, gmv: 0, totalPedidos: 0, debug });
