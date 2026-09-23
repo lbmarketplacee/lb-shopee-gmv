@@ -172,6 +172,81 @@ async function renovarDescontoFixo(accessToken, shopId, db, clienteId){
   return { renovado: true, novoDiscountId, novoInicio, novoFim, totalProdutos: itensParaAdicionar.length, debugAdicaoItens: adicaoItens };
 }
 
+// Gera um código de até 5 caracteres (A-Z, 0-9) a partir do nome do cliente + um sufixo
+// que muda a cada renovação (mês/ano), pra nunca repetir código entre uma renovação e outra.
+function gerarCodigoCupom(nomeCliente, dataReferencia){
+  const base = (nomeCliente || 'LB')
+    .toUpperCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // tira acento
+    .replace(/[^A-Z0-9]/g, '');
+  const sufixo = (dataReferencia.getMonth() + 1).toString(36).toUpperCase() + (dataReferencia.getFullYear() % 10);
+  return (base.slice(0, 5 - sufixo.length) + sufixo).slice(0, 5) || 'LB' + sufixo;
+}
+
+const NOME_CUPOM_FIXO = 'cupom fixo - lb marketplace';
+
+// Renova automaticamente o CUPOM fixo LB Marketplace (voucher, diferente do desconto por item acima).
+// Regras da empresa: 3% de desconto, mínimo de compra R$15, sem limite de desconto máximo,
+// 5.000 cupons, validade de 3 meses (90 dias — o máximo que a Shopee permite), mostra pra todo mundo na loja.
+async function renovarCupomFixo(accessToken, shopId, db, clienteId, nomeCliente){
+  const listaVouchers = await chamarShopee('/api/v2/voucher/get_voucher_list', {
+    access_token: accessToken, shop_id: shopId, status: 'all', page_size: 100
+  }, 'GET', null, 'mkt');
+  const vouchers = listaVouchers?.response?.voucher_list || listaVouchers?.response?.vouchers || [];
+  const comEsseNome = vouchers.filter(v => (v.voucher_name || '').toLowerCase().includes(NOME_CUPOM_FIXO));
+  if (!comEsseNome.length) return { renovado: false, motivo: 'Nenhum cupom com esse nome encontrado.' };
+
+  const maisRecente = comEsseNome.reduce((a, b) => (a.end_time > b.end_time ? a : b));
+
+  const agora = Math.floor(Date.now() / 1000);
+  if (maisRecente.end_time - agora > JANELA_ANTECEDENCIA) {
+    return { renovado: false, motivo: 'Ainda não está perto de vencer.', vigenteAte: maisRecente.end_time };
+  }
+
+  const jaTemProximo = comEsseNome.some(v => v.voucher_id !== maisRecente.voucher_id && v.start_time >= maisRecente.end_time);
+  if (jaTemProximo) {
+    return { renovado: false, motivo: 'Já existe uma renovação agendada.' };
+  }
+
+  const novoInicio = maisRecente.end_time + DEZ_MINUTOS;
+  const TRES_MESES_SEGUNDOS = 90 * 24 * 60 * 60; // limite máximo da própria Shopee
+  const novoFim = novoInicio + TRES_MESES_SEGUNDOS;
+  const novoCodigo = gerarCodigoCupom(nomeCliente, new Date(novoInicio * 1000));
+
+  const corpo = {
+    voucher_name: maisRecente.voucher_name,
+    voucher_code: novoCodigo,
+    start_time: novoInicio,
+    end_time: novoFim,
+    voucher_type: 1,      // cupom de loja inteira
+    reward_type: 2,       // percentual
+    percentage: 3,
+    max_price: 999999,    // sem limite de desconto máximo
+    min_basket_price: 15, // R$15,00 mínimo de compra
+    usage_quantity: 5000,
+    display_channel_list: [1],
+    display_start_time: novoInicio
+  };
+
+  const criacao = await chamarShopee('/api/v2/voucher/add_voucher', { access_token: accessToken, shop_id: shopId }, 'POST', corpo, 'mkt');
+  const novoVoucherId = criacao?.response?.voucher_id;
+  if (!novoVoucherId) {
+    return { renovado: false, motivo: `Não foi possível criar o cupom novo: ${criacao?.error || ''} ${criacao?.message || ''}` };
+  }
+
+  // Atualiza o mesmo campo que o fluxo manual usa — é ele que alimenta o card "Cupons Vencendo 7d" do Dashboard
+  if (db && clienteId) {
+    const dataFim = new Date(novoFim * 1000);
+    await db.collection('clientes').doc(clienteId).update({
+      cupomFim: dataFim.toISOString().slice(0, 16),
+      cupomAutoUltimaRenovacao: new Date(),
+      cupomAutoCodigo: novoCodigo
+    });
+  }
+
+  return { renovado: true, novoVoucherId, novoCodigo, novoInicio, novoFim };
+}
+
 // Busca pedidos no período pedido e retorna o GMV JÁ SEPARADO POR DIA (create_time),
 // pra dar pra salvar cada dia individualmente no Firestore (gmvDiario).
 async function buscarGmvPorDia(accessToken, shopId, dataInicio, dataFim){
@@ -361,12 +436,18 @@ export default async function handler(req, res) {
         // Não apaga gmvDiario, não zera gmvShopeeAutomatico — o último valor válido continua no ar.
       }
 
-      // Marketing / desconto fixo — lógica ORIGINAL, 100% intocada
+      // Marketing / desconto fixo e cupom fixo — mesmo bloco, mesma credencial
       if (cliente.shopeeMktShopId) {
         try {
           const accessTokenMkt = await garantirTokenValidoMkt(db, cliente);
           const resultadoDesconto = await renovarDescontoFixo(accessTokenMkt, cliente.shopeeMktShopId, db, cliente.id);
           resultados.push({ cliente: cliente.nome, tipo: 'desconto_fixo', ...resultadoDesconto, ok: true });
+          try {
+            const resultadoCupom = await renovarCupomFixo(accessTokenMkt, cliente.shopeeMktShopId, db, cliente.id, cliente.nome);
+            resultados.push({ cliente: cliente.nome, tipo: 'cupom_fixo', ...resultadoCupom, ok: true });
+          } catch (eCupom) {
+            resultados.push({ cliente: cliente.nome, tipo: 'cupom_fixo', erro: eCupom.message, ok: false });
+          }
         } catch (e) {
           resultados.push({ cliente: cliente.nome, tipo: 'desconto_fixo', erro: e.message, ok: false });
         }
