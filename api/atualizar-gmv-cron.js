@@ -260,6 +260,103 @@ async function renovarCupomFixo(accessToken, shopId, db, clienteId, nomeCliente)
 }
 }
 
+// Garante que a loja sempre tem uma Oferta Relâmpago agendada. Segue exatamente as datas/horários
+// que a PRÓPRIA SHOPEE libera (não tem cadência fixa tipo "toda terça") — busca o próximo horário
+// livre depois da última oferta já agendada, e se não tiver nenhum disponível ainda, não faz nada
+// (tenta de novo automaticamente na próxima semana).
+async function garantirOfertaRelampago(accessTokenMkt, shopIdMkt, accessTokenGmv, shopIdGmv, nomeCliente){
+  const PERCENTUAL = 5, QTD_POR_PRODUTO = 5, LIMITE_PRODUTOS = 20;
+
+  // Passo A: produtos ativos da loja
+  const listaProdutos = await chamarShopee('/api/v2/product/get_item_list', {
+    access_token: accessTokenGmv, shop_id: shopIdGmv, offset: 0, page_size: LIMITE_PRODUTOS, item_status: 'NORMAL'
+  }, 'GET', null, 'gmv');
+  const itens = listaProdutos?.response?.item || [];
+  if (!itens.length) return { criado: false, motivo: 'Nenhum produto ativo encontrado.' };
+  const itemIds = itens.map(i => i.item_id);
+
+  // Passo B: preço/variações de cada produto
+  const infoProdutos = await chamarShopee('/api/v2/product/get_item_base_info', {
+    access_token: accessTokenGmv, shop_id: shopIdGmv, item_id_list: itemIds.join(',')
+  }, 'GET', null, 'gmv');
+  const detalhes = infoProdutos?.response?.item_list || [];
+
+  // Passo B.2: preço do desconto fixo ativo (a oferta calcula os 5% em cima desse preço, não do cheio)
+  const mapaDescontoAtivo = {};
+  try {
+    const listaDescontos = await chamarShopee('/api/v2/discount/get_discount_list', {
+      access_token: accessTokenMkt, shop_id: shopIdMkt, discount_status: 'ongoing', page_size: 100
+    }, 'GET', null, 'mkt');
+    const descontos = listaDescontos?.response?.discount_list || [];
+    for (const desc of descontos) {
+      const detalheDesconto = await chamarShopee('/api/v2/discount/get_discount', {
+        access_token: accessTokenMkt, shop_id: shopIdMkt, discount_id: desc.discount_id
+      }, 'GET', null, 'mkt');
+      const itensDesconto = detalheDesconto?.response?.item_list || [];
+      itensDesconto.forEach(di => {
+        const precoComDesconto = di?.model_list?.[0]?.discount_price ?? di?.item_promotion_price;
+        if (precoComDesconto) mapaDescontoAtivo[di.item_id] = precoComDesconto;
+      });
+    }
+  } catch (e) { /* segue com preço normal como fallback */ }
+
+  // Passo C: montar itens com preço promocional
+  const itensParaOferta = [];
+  for (const item of detalhes) {
+    const precoAtual = mapaDescontoAtivo[item.item_id] ?? item?.price_info?.[0]?.current_price;
+    if (item.has_model) {
+      const modelos = await chamarShopee('/api/v2/product/get_model_list', {
+        access_token: accessTokenGmv, shop_id: shopIdGmv, item_id: item.item_id
+      }, 'GET', null, 'gmv');
+      const listaModelos = modelos?.response?.model || [];
+      const models = listaModelos.map(m => {
+        const preco = m?.price_info?.[0]?.current_price || precoAtual || 0;
+        return { model_id: m.model_id, input_promo_price: Math.round((preco * (1 - PERCENTUAL / 100)) * 100) / 100, stock: QTD_POR_PRODUTO };
+      }).filter(m => m.input_promo_price > 0);
+      if (models.length) itensParaOferta.push({ item_id: item.item_id, purchase_limit: QTD_POR_PRODUTO, models });
+    } else if (precoAtual) {
+      itensParaOferta.push({
+        item_id: item.item_id, purchase_limit: QTD_POR_PRODUTO,
+        models: [{ model_id: 0, input_promo_price: Math.round((precoAtual * (1 - PERCENTUAL / 100)) * 100) / 100, stock: QTD_POR_PRODUTO }]
+      });
+    }
+  }
+  if (!itensParaOferta.length) return { criado: false, motivo: 'Não foi possível calcular preço promocional pra nenhum produto.' };
+
+  // Passo D: não sobrepor com oferta já agendada/em andamento — busca a partir de onde a última termina
+  let agora = Math.floor(Date.now() / 1000);
+  try {
+    const ofertasExistentes = await chamarShopee('/api/v2/shop_flash_sale/get_shop_flash_sale_list', {
+      access_token: accessTokenMkt, shop_id: shopIdMkt, type: 1, offset: 0, limit: 100
+    }, 'GET', null, 'mkt');
+    const listaExistentes = ofertasExistentes?.response?.flash_sale_list || [];
+    listaExistentes.forEach(f => { if (f.end_time && f.end_time > agora) agora = f.end_time + 60; });
+  } catch (e) { /* segue a partir de agora mesmo */ }
+
+  // Passo D.2: só cria se a Shopee JÁ TIVER liberado um horário novo — se não tiver, não é erro,
+  // é só "ainda não liberou", tenta de novo automaticamente semana que vem.
+  const daqui7dias = agora + 7 * 24 * 60 * 60;
+  const horarios = await chamarShopee('/api/v2/shop_flash_sale/get_time_slot_id', {
+    access_token: accessTokenMkt, shop_id: shopIdMkt, start_time: agora, end_time: daqui7dias
+  }, 'GET', null, 'mkt');
+  const proximoSlot = horarios?.response?.[0]?.timeslot_id;
+  if (!proximoSlot) return { criado: false, motivo: 'Shopee ainda não liberou nenhum horário novo pros próximos 7 dias.' };
+
+  // Passo E: criar a oferta nesse horário
+  const criacao = await chamarShopee('/api/v2/shop_flash_sale/create_shop_flash_sale', {
+    access_token: accessTokenMkt, shop_id: shopIdMkt
+  }, 'POST', { timeslot_id: proximoSlot }, 'mkt');
+  const flashSaleId = criacao?.response?.flash_sale_id;
+  if (!flashSaleId) return { criado: false, motivo: `Não foi possível criar a oferta: ${criacao?.error || ''} ${criacao?.message || ''}` };
+
+  // Passo F: adicionar os produtos com preço promocional
+  await chamarShopee('/api/v2/shop_flash_sale/add_shop_flash_sale_items', {
+    access_token: accessTokenMkt, shop_id: shopIdMkt
+  }, 'POST', { flash_sale_id: flashSaleId, items: itensParaOferta }, 'mkt');
+
+  return { criado: true, flashSaleId, timeslotId: proximoSlot, totalProdutos: itensParaOferta.length };
+}
+
 // Busca pedidos no período pedido e retorna o GMV JÁ SEPARADO POR DIA (create_time),
 // pra dar pra salvar cada dia individualmente no Firestore (gmvDiario).
 async function buscarGmvPorDia(accessToken, shopId, dataInicio, dataFim){
@@ -460,6 +557,13 @@ export default async function handler(req, res) {
             resultados.push({ cliente: cliente.nome, tipo: 'cupom_fixo', ...resultadoCupom, ok: true });
           } catch (eCupom) {
             resultados.push({ cliente: cliente.nome, tipo: 'cupom_fixo', erro: eCupom.message, ok: false });
+          }
+          try {
+            const accessTokenGmvParaOferta = await garantirTokenValido(db, cliente);
+            const resultadoOferta = await garantirOfertaRelampago(accessTokenMkt, cliente.shopeeMktShopId, accessTokenGmvParaOferta, cliente.shopeeShopId, cliente.nome);
+            resultados.push({ cliente: cliente.nome, tipo: 'oferta_relampago', ...resultadoOferta, ok: true });
+          } catch (eOferta) {
+            resultados.push({ cliente: cliente.nome, tipo: 'oferta_relampago', erro: eOferta.message, ok: false });
           }
         } catch (e) {
           resultados.push({ cliente: cliente.nome, tipo: 'desconto_fixo', erro: e.message, ok: false });
