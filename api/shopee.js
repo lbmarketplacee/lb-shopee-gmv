@@ -37,12 +37,12 @@ function getConfig(app = 'gmv'){
 
 // Faz a chamada HTTP passando SEMPRE pelo proxy fixo (IP fixo), usando https-proxy-agent
 // (o ProxyAgent do undici tem um bug conhecido com proxy autenticado + HTTPS — trocamos por essa lib)
-function chamarShopee(path, params = {}, metodo = 'GET', body = null, app = 'gmv'){
+function chamarShopee(path, params = {}, metodo = 'GET', body = null, app = 'gmv', semProxy = false){
   return new Promise((resolve, reject) => {
     const { partnerId, partnerKey, ambiente, quotaguardUrl } = getConfig(app);
     const host = HOSTS[ambiente];
     if (!partnerId || !partnerKey) return reject(new Error(`Credenciais da Shopee (${app}) não configuradas.`));
-    if (!quotaguardUrl) return reject(new Error('FIXIE_URL não configurada.'));
+    if (!semProxy && !quotaguardUrl) return reject(new Error('FIXIE_URL não configurada.'));
 
     const timestamp = Math.floor(Date.now() / 1000);
     const sign = gerarAssinatura(path, timestamp, partnerId, partnerKey, params.access_token || '', params.shop_id || '');
@@ -53,21 +53,23 @@ function chamarShopee(path, params = {}, metodo = 'GET', body = null, app = 'gmv
     url.searchParams.set('sign', sign);
     Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== '') url.searchParams.set(k, v); });
 
-    const proxyUrlObj = new URL(quotaguardUrl);
-    // Monta o cabeçalho Proxy-Authorization manualmente (Basic Auth) e passa direto pro agente —
-    // é ele quem faz o túnel CONNECT com o proxy, não confia só na extração automática da URL
-    const headersProxy = {};
-    if (proxyUrlObj.username || proxyUrlObj.password) {
-      const credencial = Buffer.from(`${decodeURIComponent(proxyUrlObj.username)}:${decodeURIComponent(proxyUrlObj.password)}`).toString('base64');
-      headersProxy['Proxy-Authorization'] = `Basic ${credencial}`;
-    }
-    const agent = new HttpsProxyAgent(quotaguardUrl, { headers: headersProxy });
     const corpo = body ? JSON.stringify(body) : null;
     const opts = {
       method: metodo,
-      agent,
       headers: corpo ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(corpo) } : {}
     };
+
+    // TESTE TEMPORÁRIO (só entra aqui se semProxy=true for passado explicitamente):
+    // pula o Fixie por completo — chamada sai direto do IP da Vercel, sem proxy nenhum.
+    if (!semProxy) {
+      const proxyUrlObj = new URL(quotaguardUrl);
+      const headersProxy = {};
+      if (proxyUrlObj.username || proxyUrlObj.password) {
+        const credencial = Buffer.from(`${decodeURIComponent(proxyUrlObj.username)}:${decodeURIComponent(proxyUrlObj.password)}`).toString('base64');
+        headersProxy['Proxy-Authorization'] = `Basic ${credencial}`;
+      }
+      opts.agent = new HttpsProxyAgent(quotaguardUrl, { headers: headersProxy });
+    }
 
     const req = https.request(url, opts, (resp) => {
       let dados = '';
@@ -388,14 +390,14 @@ export default async function handler(req, res) {
 
     // 9) Saldo do Shopee Ads (app Ads)
     if (acao === 'saldo_ads') {
-      const { access_token, shop_id } = params;
+      const { access_token, shop_id, sem_proxy } = params;
       const resultado = await chamarShopee('/api/v2/ads/get_total_balance', {
         access_token, shop_id
-      }, 'GET', null, 'ads');
+      }, 'GET', null, 'ads', sem_proxy === '1');
       if (resultado?.error) {
-        return res.status(200).json({ ok: false, erro: `${resultado.error}: ${resultado.message || ''}`, debug: resultado });
+        return res.status(200).json({ ok: false, erro: `${resultado.error}: ${resultado.message || ''}`, debug: resultado, semProxyUsado: sem_proxy === '1' });
       }
-      return res.status(200).json({ ok: true, saldo: resultado?.response?.total_balance ?? 0, debug: resultado });
+      return res.status(200).json({ ok: true, saldo: resultado?.response?.total_balance ?? 0, debug: resultado, semProxyUsado: sem_proxy === '1' });
     }
 
     return res.status(400).json({ erro: 'Ação não reconhecida.' });
