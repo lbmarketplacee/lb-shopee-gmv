@@ -185,7 +185,49 @@ function gerarCodigoCupom(nomeCliente, dataReferencia){
 
 const NOME_CUPOM_FIXO = 'cupom fixo - lb marketplace';
 
-// Renova automaticamente o CUPOM fixo LB Marketplace (voucher, diferente do desconto por item acima).
+// Cria (ou recria) o cupom fixo — função interna, usada tanto pra criar do zero quanto pra renovar.
+async function criarCupomFixo(accessToken, shopId, db, clienteId, nomeCliente, inicioUnix){
+  const TRES_MESES_SEGUNDOS = 90 * 24 * 60 * 60; // limite máximo da própria Shopee
+  const fimUnix = inicioUnix + TRES_MESES_SEGUNDOS;
+  const codigo = gerarCodigoCupom(nomeCliente, new Date(inicioUnix * 1000));
+
+  const corpo = {
+    voucher_name: 'Cupom Fixo - LB Marketplace',
+    voucher_code: codigo,
+    start_time: inicioUnix,
+    end_time: fimUnix,
+    voucher_type: 1,      // cupom de loja inteira
+    reward_type: 2,       // percentual
+    percentage: 3,
+    max_price: 999999,    // sem limite de desconto máximo
+    min_basket_price: 15, // R$15,00 mínimo de compra
+    usage_quantity: 5000,
+    display_channel_list: [1],
+    display_start_time: inicioUnix
+  };
+
+  const criacao = await chamarShopee('/api/v2/voucher/add_voucher', { access_token: accessToken, shop_id: shopId }, 'POST', corpo, 'mkt');
+  const voucherId = criacao?.response?.voucher_id;
+  if (!voucherId) {
+    return { renovado: false, motivo: `Não foi possível criar o cupom: ${criacao?.error || ''} ${criacao?.message || ''}` };
+  }
+
+  // Atualiza o mesmo campo que o fluxo manual usa — é ele que alimenta o card "Cupons Vencendo 7d" do Dashboard
+  if (db && clienteId) {
+    const dataFim = new Date(fimUnix * 1000);
+    await db.collection('clientes').doc(clienteId).update({
+      cupomFim: dataFim.toISOString().slice(0, 16),
+      cupomAutoUltimaRenovacao: new Date(),
+      cupomAutoCodigo: codigo
+    });
+  }
+
+  return { renovado: true, novoVoucherId: voucherId, novoCodigo: codigo, novoInicio: inicioUnix, novoFim: fimUnix };
+}
+
+// Garante que o CUPOM fixo LB Marketplace está sempre ativo (voucher, diferente do desconto por item acima).
+// Checa DIRETO na Shopee (não depende de nada salvo no nosso banco) — se não achar nenhum, cria do zero
+// (cliente novo, cupom apagado manualmente, etc). Se achar e estiver perto de vencer, renova.
 // Regras da empresa: 3% de desconto, mínimo de compra R$15, sem limite de desconto máximo,
 // 5.000 cupons, validade de 3 meses (90 dias — o máximo que a Shopee permite), mostra pra todo mundo na loja.
 async function renovarCupomFixo(accessToken, shopId, db, clienteId, nomeCliente){
@@ -194,11 +236,17 @@ async function renovarCupomFixo(accessToken, shopId, db, clienteId, nomeCliente)
   }, 'GET', null, 'mkt');
   const vouchers = listaVouchers?.response?.voucher_list || listaVouchers?.response?.vouchers || [];
   const comEsseNome = vouchers.filter(v => (v.voucher_name || '').toLowerCase().includes(NOME_CUPOM_FIXO));
-  if (!comEsseNome.length) return { renovado: false, motivo: 'Nenhum cupom com esse nome encontrado.' };
+
+  const agora = Math.floor(Date.now() / 1000);
+
+  // Nenhum cupom com esse nome — cliente novo ou cupom sumiu. Cria já, começando agora.
+  if (!comEsseNome.length) {
+    const resultado = await criarCupomFixo(accessToken, shopId, db, clienteId, nomeCliente, agora + DEZ_MINUTOS);
+    return { ...resultado, criadoDoZero: true };
+  }
 
   const maisRecente = comEsseNome.reduce((a, b) => (a.end_time > b.end_time ? a : b));
 
-  const agora = Math.floor(Date.now() / 1000);
   if (maisRecente.end_time - agora > JANELA_ANTECEDENCIA) {
     return { renovado: false, motivo: 'Ainda não está perto de vencer.', vigenteAte: maisRecente.end_time };
   }
@@ -208,43 +256,8 @@ async function renovarCupomFixo(accessToken, shopId, db, clienteId, nomeCliente)
     return { renovado: false, motivo: 'Já existe uma renovação agendada.' };
   }
 
-  const novoInicio = maisRecente.end_time + DEZ_MINUTOS;
-  const TRES_MESES_SEGUNDOS = 90 * 24 * 60 * 60; // limite máximo da própria Shopee
-  const novoFim = novoInicio + TRES_MESES_SEGUNDOS;
-  const novoCodigo = gerarCodigoCupom(nomeCliente, new Date(novoInicio * 1000));
-
-  const corpo = {
-    voucher_name: maisRecente.voucher_name,
-    voucher_code: novoCodigo,
-    start_time: novoInicio,
-    end_time: novoFim,
-    voucher_type: 1,      // cupom de loja inteira
-    reward_type: 2,       // percentual
-    percentage: 3,
-    max_price: 999999,    // sem limite de desconto máximo
-    min_basket_price: 15, // R$15,00 mínimo de compra
-    usage_quantity: 5000,
-    display_channel_list: [1],
-    display_start_time: novoInicio
-  };
-
-  const criacao = await chamarShopee('/api/v2/voucher/add_voucher', { access_token: accessToken, shop_id: shopId }, 'POST', corpo, 'mkt');
-  const novoVoucherId = criacao?.response?.voucher_id;
-  if (!novoVoucherId) {
-    return { renovado: false, motivo: `Não foi possível criar o cupom novo: ${criacao?.error || ''} ${criacao?.message || ''}` };
-  }
-
-  // Atualiza o mesmo campo que o fluxo manual usa — é ele que alimenta o card "Cupons Vencendo 7d" do Dashboard
-  if (db && clienteId) {
-    const dataFim = new Date(novoFim * 1000);
-    await db.collection('clientes').doc(clienteId).update({
-      cupomFim: dataFim.toISOString().slice(0, 16),
-      cupomAutoUltimaRenovacao: new Date(),
-      cupomAutoCodigo: novoCodigo
-    });
-  }
-
-  return { renovado: true, novoVoucherId, novoCodigo, novoInicio, novoFim };
+  return await criarCupomFixo(accessToken, shopId, db, clienteId, nomeCliente, maisRecente.end_time + DEZ_MINUTOS);
+}
 }
 
 // Busca pedidos no período pedido e retorna o GMV JÁ SEPARADO POR DIA (create_time),
