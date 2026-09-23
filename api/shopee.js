@@ -147,12 +147,11 @@ export default async function handler(req, res) {
         inicioJanela = fimJanela + 1;
       }
 
-      let todosOrderSn = [];
-      for (const [timeFrom, timeTo] of janelas) {
-        // Busca TODOS os pedidos do período (sem filtro de status) — GMV conta toda venda válida,
-        // não só a 100% "concluída" (que só acontece dias depois, quando o comprador confirma o recebimento).
-        // Excluímos manualmente só os que não são venda de verdade: cancelados e não pagos.
-        const STATUS_EXCLUIR = ['CANCELLED', 'UNPAID', 'INVOICE_PENDING'];
+      // Busca as janelas de 15 dias EM PARALELO (cada janela é independente) — antes rodava
+      // uma depois da outra, o que estourava o tempo máximo da função em lojas com muitos pedidos.
+      const STATUS_EXCLUIR = ['CANCELLED', 'UNPAID', 'INVOICE_PENDING'];
+      const resultadosJanelas = await Promise.all(janelas.map(async ([timeFrom, timeTo]) => {
+        const idsDaJanela = [];
         let cursor = '', paginas = 0;
         do {
           const resultado = await chamarShopee('/api/v2/order/get_order_list', {
@@ -162,13 +161,15 @@ export default async function handler(req, res) {
             page_size: 100, cursor
           }, 'GET', null, 'gmv');
           const lista = resultado?.response?.order_list || [];
-          lista.forEach(o => { if (!STATUS_EXCLUIR.includes(o.order_status)) todosOrderSn.push(o.order_sn); });
+          lista.forEach(o => { if (!STATUS_EXCLUIR.includes(o.order_status)) idsDaJanela.push(o.order_sn); });
           cursor = resultado?.response?.next_cursor || '';
           paginas++;
           if (paginas > 30) break;
         } while (cursor);
-        debug.janelas.push({ timeFrom, timeTo });
-      }
+        debug.janelas.push({ timeFrom, timeTo, pedidosNaJanela: idsDaJanela.length });
+        return idsDaJanela;
+      }));
+      let todosOrderSn = resultadosJanelas.flat();
 
       if (!todosOrderSn.length) {
         return res.status(200).json({ ok: true, gmv: 0, totalPedidos: 0, debug });
@@ -181,7 +182,7 @@ export default async function handler(req, res) {
       const lotes = [];
       for (let i = 0; i < todosOrderSn.length; i += 50) lotes.push(todosOrderSn.slice(i, i + 50));
 
-      const LIMITE_PARALELO = 8; // no máximo 8 chamadas ao mesmo tempo, pra não sobrecarregar
+      const LIMITE_PARALELO = 15; // no máximo 15 chamadas ao mesmo tempo, pra não sobrecarregar
       for (let i = 0; i < lotes.length; i += LIMITE_PARALELO) {
         const grupo = lotes.slice(i, i + LIMITE_PARALELO);
         const respostas = await Promise.all(grupo.map(lote => chamarShopee('/api/v2/order/get_order_detail', {
