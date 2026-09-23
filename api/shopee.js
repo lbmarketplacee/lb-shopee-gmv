@@ -5,11 +5,13 @@
 //   App Marketing (cupons/ofertas relâmpago):
 //     SHOPEE_MKT_PARTNER_ID, SHOPEE_MKT_PARTNER_KEY
 //   Comuns:
-//     SHOPEE_AMBIENTE (sandbox|producao), FIXIE_URL
+//     SHOPEE_AMBIENTE (sandbox|producao)
+//
+// Desde 22/09/2026 o whitelist de IP foi desativado nos 3 apps da Shopee (Ads, Marketing, GMV),
+// então as chamadas não passam mais por proxy fixo (Fixie) — saem direto da Vercel.
 
 import crypto from 'crypto';
 import https from 'node:https';
-import { HttpsProxyAgent } from 'https-proxy-agent';
 
 const HOSTS = {
   sandbox: 'https://openplatform.sandbox.test-stable.shopee.sg',
@@ -30,19 +32,16 @@ function getConfig(app = 'gmv'){
     app,
     partnerId: limpar(process.env[`${prefixo}PARTNER_ID`]),
     partnerKey: limpar(process.env[`${prefixo}PARTNER_KEY`]),
-    ambiente: limpar(process.env.SHOPEE_AMBIENTE) || 'sandbox',
-    quotaguardUrl: limpar(process.env.FIXIE_URL)
+    ambiente: limpar(process.env.SHOPEE_AMBIENTE) || 'sandbox'
   };
 }
 
-// Faz a chamada HTTP passando SEMPRE pelo proxy fixo (IP fixo), usando https-proxy-agent
-// (o ProxyAgent do undici tem um bug conhecido com proxy autenticado + HTTPS — trocamos por essa lib)
-function chamarShopee(path, params = {}, metodo = 'GET', body = null, app = 'gmv', semProxy = false){
+// Faz a chamada HTTP direto pra Shopee, sem proxy (o whitelist de IP foi desativado nos 3 apps)
+function chamarShopee(path, params = {}, metodo = 'GET', body = null, app = 'gmv'){
   return new Promise((resolve, reject) => {
-    const { partnerId, partnerKey, ambiente, quotaguardUrl } = getConfig(app);
+    const { partnerId, partnerKey, ambiente } = getConfig(app);
     const host = HOSTS[ambiente];
     if (!partnerId || !partnerKey) return reject(new Error(`Credenciais da Shopee (${app}) não configuradas.`));
-    if (!semProxy && !quotaguardUrl) return reject(new Error('FIXIE_URL não configurada.'));
 
     const timestamp = Math.floor(Date.now() / 1000);
     const sign = gerarAssinatura(path, timestamp, partnerId, partnerKey, params.access_token || '', params.shop_id || '');
@@ -58,18 +57,6 @@ function chamarShopee(path, params = {}, metodo = 'GET', body = null, app = 'gmv
       method: metodo,
       headers: corpo ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(corpo) } : {}
     };
-
-    // TESTE TEMPORÁRIO (só entra aqui se semProxy=true for passado explicitamente):
-    // pula o Fixie por completo — chamada sai direto do IP da Vercel, sem proxy nenhum.
-    if (!semProxy) {
-      const proxyUrlObj = new URL(quotaguardUrl);
-      const headersProxy = {};
-      if (proxyUrlObj.username || proxyUrlObj.password) {
-        const credencial = Buffer.from(`${decodeURIComponent(proxyUrlObj.username)}:${decodeURIComponent(proxyUrlObj.password)}`).toString('base64');
-        headersProxy['Proxy-Authorization'] = `Basic ${credencial}`;
-      }
-      opts.agent = new HttpsProxyAgent(quotaguardUrl, { headers: headersProxy });
-    }
 
     const req = https.request(url, opts, (resp) => {
       let dados = '';
@@ -97,7 +84,7 @@ export default async function handler(req, res) {
     // Qual app usar nesta chamada: o front manda "app" = 'gmv' ou 'mkt'.
     // Se não mandar nada, cai no 'gmv' (mantém compatibilidade com o que já existe).
     const appEscolhido = (params.app === 'mkt' || params.app === 'ads') ? params.app : 'gmv';
-    const { partnerId, partnerKey, ambiente, quotaguardUrl } = getConfig(appEscolhido);
+    const { partnerId, partnerKey, ambiente } = getConfig(appEscolhido);
 
     // 0) Diagnóstico — nunca expõe a chave, só confirma tamanho/formato
     if (acao === 'diagnostico') {
@@ -107,7 +94,7 @@ export default async function handler(req, res) {
       return res.status(200).json({
         ok: true,
         ambiente,
-        quotaguard_configurado: !!quotaguardUrl,
+        proxy_usado: false,
         gmv: { partner_id_valor: gmv.partnerId, partner_id_tamanho: gmv.partnerId.length, partner_key_tamanho: gmv.partnerKey.length },
         mkt: { partner_id_valor: mkt.partnerId, partner_id_tamanho: mkt.partnerId.length, partner_key_tamanho: mkt.partnerKey.length },
         ads: { partner_id_valor: ads.partnerId, partner_id_tamanho: ads.partnerId.length, partner_key_tamanho: ads.partnerKey.length }
@@ -260,7 +247,6 @@ export default async function handler(req, res) {
     // 8) Criar Oferta Relâmpago — 100% automática, respeitando as regras da loja
     //    Até "limite_produtos" produtos, "qtd_por_produto" unidades cada, desconto de "percentual"% sobre o preço atual
     if (acao === 'criar_oferta_relampago') {
-      return res.status(200).json({ ok: false, erro: 'Função pausada temporariamente pra economizar banda do QuotaGuard. Fala com o Lincoln pra reativar.' });
       const { access_token, shop_id, access_token_gmv, shop_id_gmv } = params;
       const percentual = Number(params.percentual || 5);
       const qtdPorProduto = Number(params.qtd_por_produto || 5);
@@ -390,14 +376,14 @@ export default async function handler(req, res) {
 
     // 9) Saldo do Shopee Ads (app Ads)
     if (acao === 'saldo_ads') {
-      const { access_token, shop_id, sem_proxy } = params;
+      const { access_token, shop_id } = params;
       const resultado = await chamarShopee('/api/v2/ads/get_total_balance', {
         access_token, shop_id
-      }, 'GET', null, 'ads', sem_proxy === '1');
+      }, 'GET', null, 'ads');
       if (resultado?.error) {
-        return res.status(200).json({ ok: false, erro: `${resultado.error}: ${resultado.message || ''}`, debug: resultado, semProxyUsado: sem_proxy === '1' });
+        return res.status(200).json({ ok: false, erro: `${resultado.error}: ${resultado.message || ''}`, debug: resultado });
       }
-      return res.status(200).json({ ok: true, saldo: resultado?.response?.total_balance ?? 0, debug: resultado, semProxyUsado: sem_proxy === '1' });
+      return res.status(200).json({ ok: true, saldo: resultado?.response?.total_balance ?? 0, debug: resultado });
     }
 
     return res.status(400).json({ erro: 'Ação não reconhecida.' });
