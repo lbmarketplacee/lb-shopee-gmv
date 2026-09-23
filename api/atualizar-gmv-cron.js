@@ -1,9 +1,11 @@
 // Atualização automática semanal de GMV — roda sozinha via Vercel Cron Job
 // Busca todos os clientes conectados à Shopee no Firestore, renova token se preciso,
 // calcula o GMV dos últimos 30 dias de cada um, e salva de volta no Firestore.
+//
+// Desde 22/09/2026 o whitelist de IP foi desativado nos 3 apps da Shopee, então as
+// chamadas saem direto (sem proxy fixo/Fixie).
 
 import crypto from 'crypto';
-import { ProxyAgent, fetch as undiciFetch } from 'undici';
 import { initializeApp, cert, getApps } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 
@@ -24,13 +26,12 @@ function getConfig(app = 'gmv'){
   return {
     partnerId: limpar(process.env[`${prefixo}PARTNER_ID`]),
     partnerKey: limpar(process.env[`${prefixo}PARTNER_KEY`]),
-    ambiente: limpar(process.env.SHOPEE_AMBIENTE) || 'sandbox',
-    quotaguardUrl: limpar(process.env.FIXIE_URL)
+    ambiente: limpar(process.env.SHOPEE_AMBIENTE) || 'sandbox'
   };
 }
 
 async function chamarShopee(path, params = {}, metodo = 'GET', body = null, app = 'gmv'){
-  const { partnerId, partnerKey, ambiente, quotaguardUrl } = getConfig(app);
+  const { partnerId, partnerKey, ambiente } = getConfig(app);
   const host = HOSTS[ambiente];
   const timestamp = Math.floor(Date.now() / 1000);
   const sign = gerarAssinatura(path, timestamp, partnerId, partnerKey, params.access_token || '', params.shop_id || '');
@@ -39,10 +40,9 @@ async function chamarShopee(path, params = {}, metodo = 'GET', body = null, app 
   url.searchParams.set('timestamp', timestamp);
   url.searchParams.set('sign', sign);
   Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== '') url.searchParams.set(k, v); });
-  const dispatcher = new ProxyAgent(quotaguardUrl);
-  const opts = { method: metodo, dispatcher };
+  const opts = { method: metodo };
   if (body) { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
-  const resp = await undiciFetch(url.toString(), opts);
+  const resp = await fetch(url.toString(), opts);
   CONTADOR_CHAMADAS_SHOPEE++; // conta toda chamada real à Shopee (GMV, token, Marketing/desconto — tudo passa por aqui)
   return await resp.json();
 }
