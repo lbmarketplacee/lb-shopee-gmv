@@ -270,8 +270,10 @@ async function descDuplicar(chamar, ctx, discountId, opcoes = {}) {
 // desconto vêm do próprio desconto da loja (v2.discount.*, que o app Marketing acessa). É em cima desse
 // preço que a oferta calcula o percentual.
 const OFR_MARGEM_INICIO = 120; // a Shopee recusa início no passado: a busca de horário começa ~2 min à frente
+const OFR_ERRO_ESTOQUE = 1400101726; // "This item cannot be added as there is insufficient stock."
 
 function ofrArredondar(v) { return Math.round(v * 100) / 100; }
+function ofrNumero(v) { return typeof v === 'number' && Number.isFinite(v) ? v : null; }
 
 // A Shopee recusa a chamada quando a LOJA não atende às regras da Oferta Relâmpago da Loja (não é problema de permissão do app).
 function ofrErroAmigavel(resp, contexto) {
@@ -284,7 +286,34 @@ function ofrErroAmigavel(resp, contexto) {
   return { erro: `${contexto}: ${resp?.error || ''} ${resp?.message || ''}`.trim() };
 }
 
-// Lê o(s) desconto(s) em andamento e devolve até "limite" produtos com preço promocional já calculado.
+// A Shopee informa as recusas POR VARIAÇÃO (item_id + model_id). Produto simples vem sem model_id (chave "id:0").
+function ofrChave(f) { return `${f.item_id}:${f.model_id || 0}`; }
+function ofrEhEstoque(f) { return f.err_code === OFR_ERRO_ESTOQUE || /insufficient stock/i.test(String(f.err_msg || f.fail_message || '')); }
+
+// Quantos PRODUTOS entraram de fato: produto com variações vale se ao menos UMA variação entrou.
+function ofrContarAceitos(fatia, chavesFalhas) {
+  let aceitos = 0;
+  for (const it of fatia) {
+    if (chavesFalhas.has(`${it.item_id}:0`)) continue; // produto inteiro recusado
+    if (it.modelos) { if (it.modelos.some((m) => !chavesFalhas.has(`${it.item_id}:${m.model_id}`))) aceitos++; }
+    else aceitos++;
+  }
+  return aceitos;
+}
+
+// Resume os motivos das recusas em texto curto: "estoque insuficiente (34)".
+function ofrResumirMotivos(falhas) {
+  const cont = new Map();
+  falhas.forEach((f) => {
+    const msg = String(f.err_msg || f.fail_message || f.message || 'motivo não informado');
+    const rotulo = ofrEhEstoque(f) ? 'estoque abaixo do mínimo exigido pela Shopee pra oferta relâmpago (normalmente 20 un.)' : msg.replace(/^This item cannot be added as /i, '').slice(0, 80);
+    cont.set(rotulo, (cont.get(rotulo) || 0) + 1);
+  });
+  return [...cont.entries()].sort((x, y) => y[1] - x[1]).slice(0, 3).map(([m, n]) => `${m} (${n})`).join('; ');
+}
+
+// Lê o(s) desconto(s) em andamento e devolve os produtos com preço promocional já calculado.
+// Usa o estoque real que o desconto informa (quando informa) pra nunca pedir mais unidades do que existem.
 async function descItensParaOfertaRelampago(chamar, ctx, { discountId, percentual, qtdPorProduto, limite }) {
   const agora = Math.floor(Date.now() / 1000);
   let ids = [];
@@ -303,6 +332,8 @@ async function descItensParaOfertaRelampago(chamar, ctx, { discountId, percentua
   const itens = [];
   const vistos = new Set();
   const erros = [];
+  let estoqueConhecido = false;
+  let amostra = null;
   for (const id of ids) {
     const lido = await descLerDesconto(chamar, ctx, id);
     if (!lido.ok) { erros.push(lido.erro); continue; }
@@ -310,25 +341,35 @@ async function descItensParaOfertaRelampago(chamar, ctx, { discountId, percentua
       if (lido.meta.end_time && lido.meta.end_time <= agora) return { ok: false, erro: 'O desconto fixo marcado já terminou. Duplique/renove ele antes de criar a oferta relâmpago.' };
       if (lido.meta.start_time && lido.meta.start_time > agora) return { ok: false, erro: 'O desconto fixo marcado ainda não começou. A oferta relâmpago só usa desconto em andamento.' };
     }
+    if (!amostra && lido.itens[0]) amostra = JSON.stringify(lido.itens[0]).slice(0, 700);
     for (const it of lido.itens) {
       if (itens.length >= limite) break;
       if (vistos.has(it.item_id)) continue;
       vistos.add(it.item_id);
       const modelos = (it.model_list || [])
-        .map((m) => ({ model_id: m.model_id, preco: m.model_promotion_price ?? m.discount_price }))
+        .map((m) => ({ model_id: m.model_id, preco: m.model_promotion_price ?? m.discount_price,
+                       estoque: ofrNumero(m.model_normal_stock) ?? ofrNumero(m.normal_stock) ?? ofrNumero(m.model_stock) }))
         .filter((m) => m.preco > 0);
       if (modelos.length) {
-        itens.push({ item_id: it.item_id, modelos: modelos.map((m) => ({ model_id: m.model_id, input_promo_price: ofrArredondar(m.preco * fator), stock: qtdPorProduto })) });
+        modelos.forEach((m) => { if (m.estoque !== null) estoqueConhecido = true; });
+        const usaveis = modelos.filter((m) => m.estoque === null || m.estoque >= 1); // variação sem estoque não entra
+        if (!usaveis.length) continue;
+        itens.push({ item_id: it.item_id, modelos: usaveis.map((m) => ({ model_id: m.model_id,
+          input_promo_price: ofrArredondar(m.preco * fator), stock: m.estoque === null ? qtdPorProduto : Math.min(qtdPorProduto, m.estoque) })) });
       } else if (!(it.model_list || []).length && it.item_promotion_price > 0) {
-        itens.push({ item_id: it.item_id, simples: { input_promo_price: ofrArredondar(it.item_promotion_price * fator), stock: qtdPorProduto } });
+        const estoque = ofrNumero(it.normal_stock) ?? ofrNumero(it.item_normal_stock);
+        if (estoque !== null) estoqueConhecido = true;
+        if (estoque !== null && estoque < 1) continue;
+        itens.push({ item_id: it.item_id, simples: { input_promo_price: ofrArredondar(it.item_promotion_price * fator),
+          stock: estoque === null ? qtdPorProduto : Math.min(qtdPorProduto, estoque) } });
       }
     }
     if (itens.length >= limite) break;
   }
   if (!itens.length) {
-    return { ok: false, erro: erros.length ? `Não consegui ler o desconto: ${erros[0]}` : 'Não consegui ler o preço promocional de nenhum produto do desconto.' };
+    return { ok: false, erro: erros.length ? `Não consegui ler o desconto: ${erros[0]}` : 'Não consegui ler o preço promocional de nenhum produto do desconto (ou todos estão sem estoque).' };
   }
-  return { ok: true, itens };
+  return { ok: true, itens, estoqueConhecido, amostra };
 }
 
 // Produto simples: tenta o formato "item_input_promo_price/item_stock"; se a Shopee recusar, o formato "models" (model_id 0).
@@ -381,7 +422,7 @@ function ofrFatia(itens, indice, limite) {
 }
 
 // Cria uma oferta relâmpago em CADA horário livre que a Shopee liberou (até maxHorarios).
-// Horário que a loja já tem é pulado; se nenhum produto entrar num horário, a oferta vazia é apagada;
+// Horário que a loja já tem é pulado; se NENHUM produto entrar num horário, a oferta vazia é apagada;
 // depois de 2 horários seguidos sem sucesso, para (evita insistir num erro que se repete).
 async function descCriarOfertasRelampago(chamar, ctx, opcoes = {}) {
   const percentual = opcoes.percentual ?? 5;
@@ -414,6 +455,7 @@ async function descCriarOfertasRelampago(chamar, ctx, opcoes = {}) {
   let formato = 'item';
   let semSucessoSeguidos = 0;
   const deslocamento = existentes.lista.length; // ofertas que a loja já tem empurram a rotação de produtos
+  const listaFalhas = (r) => { const l = r?.response?.failed_items ?? r?.response?.failed_list ?? []; return Array.isArray(l) ? l : []; };
 
   for (const slot of livres.slice(0, maxHorarios)) {
     const inicioTxt = descFormatarDataLocalBR(slot.start_time);
@@ -428,35 +470,39 @@ async function descCriarOfertasRelampago(chamar, ctx, opcoes = {}) {
     }
 
     const fatia = ofrFatia(origem.itens, deslocamento + criadas.length + puladas.length, limite);
-    const adicionar = (f) => chamar('/api/v2/shop_flash_sale/add_shop_flash_sale_items', base, 'POST',
-      { flash_sale_id: flashSaleId, items: ofrMontarItens(fatia, qtd, f) });
-    const listaFalhas = (r) => { const l = r?.response?.failed_items ?? r?.response?.failed_list ?? []; return Array.isArray(l) ? l : []; };
+    const adicionar = (lista, q, f) => chamar('/api/v2/shop_flash_sale/add_shop_flash_sale_items', base, 'POST',
+      { flash_sale_id: flashSaleId, items: ofrMontarItens(lista, q, f) });
+    const aceitosDe = (r, chaves) => (r?.error ? 0 : ofrContarAceitos(fatia, chaves));
 
-    let adicao = await adicionar(formato);
-    if (fatia.some((i) => i.simples) && (adicao?.error || listaFalhas(adicao).length >= fatia.length)) {
+    let adicao = await adicionar(fatia, qtd, formato);
+    let chaves = new Set(listaFalhas(adicao).map(ofrChave));
+    if (fatia.some((i) => i.simples) && aceitosDe(adicao, chaves) === 0) {
       const outro = formato === 'item' ? 'models' : 'item';
-      const adicao2 = await adicionar(outro);
-      const ok2 = !adicao2?.error && listaFalhas(adicao2).length < fatia.length;
-      if (ok2) { adicao = adicao2; formato = outro; }
+      const adicao2 = await adicionar(fatia, qtd, outro);
+      const chaves2 = new Set(listaFalhas(adicao2).map(ofrChave));
+      if (aceitosDe(adicao2, chaves2) > 0) { adicao = adicao2; chaves = chaves2; formato = outro; }
     }
-    const falhas = listaFalhas(adicao);
-    const adicionados = adicao?.error ? 0 : Math.max(fatia.length - falhas.length, 0);
-    falhas.forEach((f) => falhasItens.push(f));
+
+    const falhasSlot = (adicao?.error ? [] : listaFalhas(adicao)).filter((f) => chaves.has(ofrChave(f)));
+    falhasSlot.forEach((f) => falhasItens.push(f));
+    const adicionados = aceitosDe(adicao, chaves);
 
     if (adicionados === 0) {
       let apagada = false;
       try { const d = await chamar('/api/v2/shop_flash_sale/delete_shop_flash_sale', base, 'POST', { flash_sale_id: flashSaleId }); apagada = !d?.error; } catch (e) { /* avisa abaixo */ }
-      puladas.push({ timeslotId: slot.timeslot_id, inicio: inicioTxt, motivo: `A Shopee não aceitou nenhum produto${adicao?.error ? ` (${adicao.error}: ${adicao.message || ''})` : ''}. ${apagada ? 'Oferta vazia apagada.' : `ATENÇÃO: oferta vazia ${flashSaleId} ficou na Shopee — apague na mão.`}` });
+      const porque = adicao?.error ? ` (${adicao.error}: ${adicao.message || ''})` : (falhasSlot.length ? ` — ${ofrResumirMotivos(falhasSlot)}` : '');
+      puladas.push({ timeslotId: slot.timeslot_id, inicio: inicioTxt, motivo: `A Shopee não aceitou nenhum produto${porque}. ${apagada ? 'Oferta vazia apagada.' : `ATENÇÃO: oferta vazia ${flashSaleId} ficou na Shopee — apague na mão.`}` });
       if (++semSucessoSeguidos >= 2) break;
       continue;
     }
     semSucessoSeguidos = 0;
-    criadas.push({ flashSaleId, timeslotId: slot.timeslot_id, inicio: inicioTxt, fim: descFormatarDataLocalBR(slot.end_time), totalProdutos: adicionados, falhas: falhas.slice(0, 3) });
+    criadas.push({ flashSaleId, timeslotId: slot.timeslot_id, inicio: inicioTxt, fim: descFormatarDataLocalBR(slot.end_time), totalProdutos: adicionados, produtosRecusados: fatia.length - adicionados, falhas: falhasSlot.slice(0, 3) });
   }
 
   const totalProdutos = criadas.reduce((s, o) => s + o.totalProdutos, 0);
   const resumo = { criadas, puladas, totalOfertas: criadas.length, totalProdutos, horariosEncontrados: horarios.slots.length,
-    jaExistiam: horarios.slots.length - livres.length, formatoUsado: formato, falhas: falhasItens.slice(0, 5),
+    jaExistiam: horarios.slots.length - livres.length, formatoUsado: formato, falhas: falhasItens.slice(0, 5), motivos: ofrResumirMotivos(falhasItens),
+    estoqueConhecido: origem.estoqueConhecido, amostraItemDesconto: origem.amostra,
     flashSaleId: criadas[0]?.flashSaleId, timeslotId: criadas[0]?.timeslotId };
   if (!criadas.length) {
     return { ok: false, ...resumo, erro: `Nenhuma oferta foi criada. ${puladas.slice(0, 2).map((p) => `${p.inicio}: ${p.motivo}`).join(' | ')}` };
@@ -618,7 +664,7 @@ async function garantirOfertasRelampago(accessTokenMkt, shopIdMkt, cliente){
     discountId: cliente.shopeeDescontoFixoId || undefined, percentual: 5, qtdPorProduto: 5, limite: 20, maxHorarios: 14
   });
   if (!r.ok) return { criado: false, motivo: r.erro, semHorario: !!r.semHorario, jaTemTodas: !!r.jaTemTodas, naoElegivel: !!r.naoElegivel };
-  return { criado: true, totalOfertas: r.totalOfertas, totalProdutos: r.totalProdutos, puladas: r.puladas.length, motivo: `${r.totalOfertas} oferta(s) criada(s) (${r.totalProdutos} produto(s))${r.puladas.length ? `, ${r.puladas.length} horário(s) pulado(s)` : ''}` };
+  return { criado: true, totalOfertas: r.totalOfertas, totalProdutos: r.totalProdutos, puladas: r.puladas.length, motivo: `${r.totalOfertas} oferta(s) criada(s) (${r.totalProdutos} produto(s))${r.puladas.length ? `, ${r.puladas.length} horário(s) pulado(s)` : ''}${r.motivos ? ` | recusas: ${r.motivos}` : ''}` };
 }
 
 // MODO DIÁRIO DE OFERTAS (?modo=ofertas): passa por TODO cliente com Marketing conectado — não depende do app GMV —,
