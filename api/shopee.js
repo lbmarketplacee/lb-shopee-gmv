@@ -232,6 +232,130 @@ async function descDuplicar(chamar, ctx, discountId, opcoes = {}) {
     duracaoDias: Math.round((novoFim - novoInicio) / 86400)
   };
 }
+
+// ===================== OFERTA RELÂMPAGO — montada a partir do DESCONTO FIXO (app Marketing) =====================
+// O app GMV não tem permissão na API de produto (error_api_permission), então os produtos e o preço com
+// desconto vêm do próprio desconto da loja (v2.discount.*, que o app Marketing acessa). É em cima desse
+// preço que a oferta calcula o percentual.
+const OFR_MARGEM_INICIO = 120; // a Shopee recusa início no passado: a busca de horário começa ~2 min à frente
+
+function ofrArredondar(v) { return Math.round(v * 100) / 100; }
+
+// Lê o(s) desconto(s) em andamento e devolve até "limite" produtos com preço promocional já calculado.
+async function descItensParaOfertaRelampago(chamar, ctx, { discountId, percentual, qtdPorProduto, limite }) {
+  const agora = Math.floor(Date.now() / 1000);
+  let ids = [];
+  if (discountId) {
+    ids = [discountId];
+  } else {
+    const todos = await descListar(chamar, ctx);
+    if (!todos.ok) return { ok: false, erro: `Não foi possível listar os descontos da loja: ${todos.erro}` };
+    ids = todos.descontos.filter((d) => d.start_time <= agora && d.end_time > agora).map((d) => d.discount_id);
+  }
+  if (!ids.length) {
+    return { ok: false, erro: 'Essa loja não tem nenhum desconto em andamento. A oferta relâmpago é montada em cima do preço do desconto fixo — crie ou marque o desconto fixo primeiro.' };
+  }
+
+  const fator = 1 - percentual / 100;
+  const itens = [];
+  const vistos = new Set();
+  const erros = [];
+  for (const id of ids) {
+    const lido = await descLerDesconto(chamar, ctx, id);
+    if (!lido.ok) { erros.push(lido.erro); continue; }
+    if (discountId) {
+      if (lido.meta.end_time && lido.meta.end_time <= agora) return { ok: false, erro: 'O desconto fixo marcado já terminou. Duplique/renove ele antes de criar a oferta relâmpago.' };
+      if (lido.meta.start_time && lido.meta.start_time > agora) return { ok: false, erro: 'O desconto fixo marcado ainda não começou. A oferta relâmpago só usa desconto em andamento.' };
+    }
+    for (const it of lido.itens) {
+      if (itens.length >= limite) break;
+      if (vistos.has(it.item_id)) continue;
+      vistos.add(it.item_id);
+      const modelos = (it.model_list || [])
+        .map((m) => ({ model_id: m.model_id, preco: m.model_promotion_price ?? m.discount_price }))
+        .filter((m) => m.preco > 0);
+      if (modelos.length) {
+        itens.push({ item_id: it.item_id, modelos: modelos.map((m) => ({ model_id: m.model_id, input_promo_price: ofrArredondar(m.preco * fator), stock: qtdPorProduto })) });
+      } else if (!(it.model_list || []).length && it.item_promotion_price > 0) {
+        itens.push({ item_id: it.item_id, simples: { input_promo_price: ofrArredondar(it.item_promotion_price * fator), stock: qtdPorProduto } });
+      }
+    }
+    if (itens.length >= limite) break;
+  }
+  if (!itens.length) {
+    return { ok: false, erro: erros.length ? `Não consegui ler o desconto: ${erros[0]}` : 'Não consegui ler o preço promocional de nenhum produto do desconto.' };
+  }
+  return { ok: true, itens };
+}
+
+// Produto simples: tenta o formato "item_input_promo_price/item_stock"; se a Shopee recusar, o formato "models" (model_id 0).
+function ofrMontarItens(itens, qtd, formatoSimples) {
+  return itens.map((it) => {
+    if (it.modelos) return { item_id: it.item_id, purchase_limit: qtd, models: it.modelos };
+    if (formatoSimples === 'item') {
+      return { item_id: it.item_id, purchase_limit: qtd, item_input_promo_price: it.simples.input_promo_price, item_stock: it.simples.stock };
+    }
+    return { item_id: it.item_id, purchase_limit: qtd, models: [{ model_id: 0, ...it.simples }] };
+  });
+}
+
+// Cria a oferta relâmpago no próximo horário livre que a Shopee liberou. Se nenhum produto entrar, apaga a oferta vazia.
+async function descCriarOfertaRelampago(chamar, ctx, opcoes = {}) {
+  const percentual = opcoes.percentual ?? 5;
+  const qtd = opcoes.qtdPorProduto ?? 5;
+  const limite = Math.min(opcoes.limite ?? 20, 20);
+  const base = { access_token: ctx.accessToken, shop_id: ctx.shopId };
+
+  const origem = await descItensParaOfertaRelampago(chamar, ctx, { discountId: opcoes.discountId, percentual, qtdPorProduto: qtd, limite });
+  if (!origem.ok) return { ok: false, erro: origem.erro };
+
+  // Não sobrepor ofertas que a loja já tem (agendadas/em andamento): procura horário depois da última.
+  let desde = Math.floor(Date.now() / 1000) + OFR_MARGEM_INICIO;
+  try {
+    const existentes = await chamar('/api/v2/shop_flash_sale/get_shop_flash_sale_list', { ...base, type: 1, offset: 0, limit: 100 }, 'GET', null);
+    (existentes?.response?.flash_sale_list || []).forEach((f) => { if (f.end_time && f.end_time + 60 > desde) desde = f.end_time + 60; });
+  } catch (e) { /* segue a partir de agora */ }
+
+  const horarios = await chamar('/api/v2/shop_flash_sale/get_time_slot_id', { ...base, start_time: desde, end_time: desde + 7 * 86400 }, 'GET', null);
+  if (horarios?.error) {
+    return { ok: false, erro: `Não foi possível buscar os horários: ${horarios.error} ${horarios.message || ''}`.trim(), debugHorarios: horarios };
+  }
+  const slot = horarios?.response?.[0]?.timeslot_id;
+  if (!slot) {
+    return { ok: false, semHorario: true, erro: 'Nenhum horário disponível na Shopee pros próximos 7 dias (considerando as ofertas que a loja já tem).', debugHorarios: horarios };
+  }
+
+  const criacao = await chamar('/api/v2/shop_flash_sale/create_shop_flash_sale', base, 'POST', { timeslot_id: slot });
+  const flashSaleId = criacao?.response?.flash_sale_id;
+  if (!flashSaleId) {
+    return { ok: false, erro: `Não foi possível criar a oferta relâmpago: ${criacao?.error || ''} ${criacao?.message || ''}`.trim(), debugCriacao: criacao };
+  }
+
+  const adicionar = (formato) => chamar('/api/v2/shop_flash_sale/add_shop_flash_sale_items', base, 'POST',
+    { flash_sale_id: flashSaleId, items: ofrMontarItens(origem.itens, qtd, formato) });
+  const listaFalhas = (r) => { const l = r?.response?.failed_items ?? r?.response?.failed_list ?? []; return Array.isArray(l) ? l : []; };
+
+  let adicao = await adicionar('item');
+  let formatoUsado = 'item';
+  const temSimples = origem.itens.some((i) => i.simples);
+  if (temSimples && (adicao?.error || listaFalhas(adicao).length >= origem.itens.length)) {
+    adicao = await adicionar('models');
+    formatoUsado = 'models';
+  }
+  const falhas = listaFalhas(adicao);
+  const adicionados = adicao?.error ? 0 : Math.max(origem.itens.length - falhas.length, 0);
+
+  if (adicionados === 0) {
+    let apagada = false;
+    try { const d = await chamar('/api/v2/shop_flash_sale/delete_shop_flash_sale', base, 'POST', { flash_sale_id: flashSaleId }); apagada = !d?.error; } catch (e) { /* avisa abaixo */ }
+    return {
+      ok: false, rollback: apagada, debugAdicao: adicao, falhas: falhas.slice(0, 5),
+      erro: `A Shopee não aceitou nenhum produto${adicao?.error ? ` (${adicao.error}: ${adicao.message || ''})` : ''}. ${apagada ? 'A oferta vazia foi apagada automaticamente.' : `ATENÇÃO: a oferta vazia (id ${flashSaleId}) ficou na Shopee — apague na mão.`}`
+    };
+  }
+  return { ok: true, flashSaleId, timeslotId: slot, totalProdutos: adicionados, falhas: falhas.slice(0, 5), formatoUsado, resultadoItens: adicao };
+}
+
 // =================== FIM — DESCONTO FIXO (lógica compartilhada) ===================
 
 export default async function handler(req, res) {
@@ -407,134 +531,21 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, ...resultado });
     }
 
-    // 8) Criar Oferta Relâmpago — 100% automática, respeitando as regras da loja
-    //    Até "limite_produtos" produtos, "qtd_por_produto" unidades cada, desconto de "percentual"% sobre o preço atual
+    // 8) Criar Oferta Relâmpago — os produtos e o preço vêm do DESCONTO FIXO da loja (app Marketing).
+    //    O app GMV não tem permissão na API de produto, por isso não depende mais dele.
+    //    Até "limite_produtos" produtos, "qtd_por_produto" unidades cada, "percentual"% sobre o preço com desconto.
     if (acao === 'criar_oferta_relampago') {
-      const { access_token, shop_id, access_token_gmv, shop_id_gmv } = params;
-      const percentual = Number(params.percentual || 5);
-      const qtdPorProduto = Number(params.qtd_por_produto || 5);
-      const limiteProdutos = Math.min(Number(params.limite_produtos || 20), 20); // Shopee também limita 20 por oferta
-
-      if (!access_token_gmv || !shop_id_gmv) {
-        return res.status(200).json({ ok: false, erro: 'Essa loja também precisa estar conectada ao app GMV (a busca de produtos usa essas credenciais). Conecte o GMV primeiro.' });
-      }
-
-      // Passo A: buscar os produtos ativos da loja (até o limite) — usa o token do app GMV, que tem acesso a catálogo
-      const listaProdutos = await chamarShopee('/api/v2/product/get_item_list', {
-        access_token: access_token_gmv, shop_id: shop_id_gmv,
-        offset: 0, page_size: limiteProdutos,
-        item_status: 'NORMAL'
-      }, 'GET', null, 'gmv');
-      const itens = listaProdutos?.response?.item || [];
-      if (!itens.length) {
-        const erroReal = listaProdutos?.error ? `${listaProdutos.error}: ${listaProdutos.message || ''}` : 'Nenhum produto ativo encontrado na loja (ou erro desconhecido).';
-        return res.status(200).json({ ok: false, erro: erroReal, debugListaProdutos: listaProdutos });
-      }
-      const itemIds = itens.map(i => i.item_id);
-
-      // Passo B: buscar preço e info de cada produto (inclui se tem variação/modelo)
-      const infoProdutos = await chamarShopee('/api/v2/product/get_item_base_info', {
-        access_token: access_token_gmv, shop_id: shop_id_gmv,
-        item_id_list: itemIds.join(',')
-      }, 'GET', null, 'gmv');
-      const detalhes = infoProdutos?.response?.item_list || [];
-
-      // Passo B.2: buscar o DESCONTO FIXO DA LOJA ativo (o preço "de verdade" já reduzido do preço de cadastro).
-      // A oferta relâmpago precisa calcular os 5% em cima DESSE preço, não do preço de cadastro cheio.
-      const mapaDescontoAtivo = {}; // item_id -> preço já com desconto fixo aplicado
-      try {
-        const listaDescontos = await chamarShopee('/api/v2/discount/get_discount_list', {
-          access_token, shop_id, discount_status: 'ongoing', page_size: 100
-        }, 'GET', null, 'mkt');
-        const descontos = listaDescontos?.response?.discount_list || [];
-        for (const desc of descontos) {
-          const detalheDesconto = await chamarShopee('/api/v2/discount/get_discount', {
-            access_token, shop_id, discount_id: desc.discount_id
-          }, 'GET', null, 'mkt');
-          const itensDesconto = detalheDesconto?.response?.item_list || [];
-          itensDesconto.forEach(di => {
-            const precoComDesconto = di?.model_list?.[0]?.model_promotion_price ?? di?.model_list?.[0]?.discount_price ?? di?.item_promotion_price;
-            if (precoComDesconto) mapaDescontoAtivo[di.item_id] = precoComDesconto;
-          });
-        }
-      } catch (e) { /* se der erro buscando desconto, seguimos com o preço normal como fallback */ }
-
-      // Passo C: montar a lista de itens com preço promocional (produto por produto, modelo por modelo)
-      const itensParaOferta = [];
-      for (const item of detalhes) {
-        // Prioridade: preço do desconto fixo ativo > preço atual do produto (fallback)
-        const precoAtual = mapaDescontoAtivo[item.item_id] ?? item?.price_info?.[0]?.current_price;
-        if (item.has_model) {
-          // Produto com variação (cor/tamanho) — busca o preço de cada modelo separadamente
-          const modelos = await chamarShopee('/api/v2/product/get_model_list', {
-            access_token: access_token_gmv, shop_id: shop_id_gmv, item_id: item.item_id
-          }, 'GET', null, 'gmv');
-          const listaModelos = modelos?.response?.model || [];
-          const models = listaModelos.map(m => {
-            const preco = m?.price_info?.[0]?.current_price || precoAtual || 0;
-            return {
-              model_id: m.model_id,
-              input_promo_price: Math.round((preco * (1 - percentual / 100)) * 100) / 100,
-              stock: qtdPorProduto
-            };
-          }).filter(m => m.input_promo_price > 0);
-          if (models.length) itensParaOferta.push({ item_id: item.item_id, purchase_limit: qtdPorProduto, models });
-        } else if (precoAtual) {
-          // Produto simples, sem variação
-          itensParaOferta.push({
-            item_id: item.item_id,
-            purchase_limit: qtdPorProduto,
-            models: [{ model_id: 0, input_promo_price: Math.round((precoAtual * (1 - percentual / 100)) * 100) / 100, stock: qtdPorProduto }]
-          });
-        }
-      }
-
-      if (!itensParaOferta.length) {
-        return res.status(200).json({ ok: false, erro: 'Não foi possível calcular preço promocional para nenhum produto.', debugDetalhes: detalhes });
-      }
-
-      // Passo D.1: verificar se a loja JÁ TEM oferta relâmpago ativa/agendada — se tiver, a nova
-      // precisa começar DEPOIS que a(s) existente(s) terminar(em), pra não dar conflito.
-      let agora = Math.floor(Date.now() / 1000);
-      try {
-        const ofertasExistentes = await chamarShopee('/api/v2/shop_flash_sale/get_shop_flash_sale_list', {
-          access_token, shop_id, type: 1, // 1 = agendada/em andamento (upcoming + ongoing)
-          offset: 0, limit: 100
-        }, 'GET', null, 'mkt');
-        const listaExistentes = ofertasExistentes?.response?.flash_sale_list || [];
-        listaExistentes.forEach(f => { if (f.end_time && f.end_time > agora) agora = f.end_time + 60; }); // +1min de folga
-      } catch (e) { /* se der erro checando, segue a partir de agora mesmo */ }
-
-      // Passo D.2: pegar um horário disponível a partir desse ponto (depois do que já existe)
-      const daqui7dias = agora + 7 * 24 * 60 * 60;
-      const horarios = await chamarShopee('/api/v2/shop_flash_sale/get_time_slot_id', {
-        access_token, shop_id, start_time: agora, end_time: daqui7dias
-      }, 'GET', null, 'mkt');
-      const proximoSlot = horarios?.response?.[0]?.timeslot_id;
-      if (!proximoSlot) {
-        return res.status(200).json({ ok: false, erro: 'Nenhum horário disponível encontrado na Shopee pros próximos 7 dias (considerando ofertas já ativas).', debugHorarios: horarios });
-      }
-
-      // Passo E: criar a "casca" da oferta relâmpago nesse horário
-      const criacao = await chamarShopee('/api/v2/shop_flash_sale/create_shop_flash_sale', {
-        access_token, shop_id
-      }, 'POST', { timeslot_id: proximoSlot }, 'mkt');
-      const flashSaleId = criacao?.response?.flash_sale_id;
-      if (!flashSaleId) {
-        return res.status(200).json({ ok: false, erro: 'Não foi possível criar a oferta relâmpago.', debugCriacao: criacao });
-      }
-
-      // Passo F: adicionar os produtos com o preço promocional
-      const adicaoItens = await chamarShopee('/api/v2/shop_flash_sale/add_shop_flash_sale_items', {
-        access_token, shop_id
-      }, 'POST', { flash_sale_id: flashSaleId, items: itensParaOferta }, 'mkt');
-
-      return res.status(200).json({
-        ok: true,
-        flash_sale_id: flashSaleId,
-        total_produtos: itensParaOferta.length,
-        resultado_itens: adicaoItens
+      const { access_token, shop_id, discount_id } = params;
+      const chamar = (path, q, metodo = 'GET', body = null) => chamarShopee(path, q, metodo, body, 'mkt');
+      const r = await descCriarOfertaRelampago(chamar, { accessToken: access_token, shopId: shop_id }, {
+        discountId: discount_id || undefined,
+        percentual: Number(params.percentual || 5),
+        qtdPorProduto: Number(params.qtd_por_produto || 5),
+        limite: Number(params.limite_produtos || 20)
       });
+      console.log('[OFERTA RELÂMPAGO]', shop_id, r.ok ? `criada ${r.flashSaleId} (${r.totalProdutos} produto(s), formato ${r.formatoUsado})` : r.erro);
+      if (!r.ok) return res.status(200).json({ ok: false, erro: r.erro, detalhe: r });
+      return res.status(200).json({ ok: true, flash_sale_id: r.flashSaleId, total_produtos: r.totalProdutos, falhas: r.falhas, resultado_itens: r.resultadoItens });
     }
 
     // 10) Listar os descontos da loja (app Marketing) — pra equipe escolher qual é o "desconto fixo"
