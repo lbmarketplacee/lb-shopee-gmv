@@ -1,6 +1,6 @@
 // Atualização automática semanal de GMV — roda sozinha via Vercel Cron Job
 // Busca todos os clientes conectados à Shopee no Firestore, renova token se preciso,
-// calcula o GMV dos últimos 30 dias de cada um, e salva de volta no Firestore.
+// calcula o GMV do mês calendário atual (dia 1º até hoje) de cada um, e salva de volta no Firestore.
 //
 // Desde 22/09/2026 o whitelist de IP foi desativado nos 3 apps da Shopee, então as
 // chamadas saem direto (sem proxy fixo/Fixie).
@@ -101,75 +101,225 @@ async function garantirTokenValidoMkt(db, cliente){
   return resultado.access_token;
 }
 
-// Renova o "desconto fixo - LB MARKETPLACE": cria um desconto NOVO (mesmo nome, 5 meses),
-// começando 10 minutos depois que o anterior encerra, copiando os mesmos produtos e preços.
-const NOME_DESCONTO_FIXO = 'desconto fixo - lb marketplace';
 const DEZ_MINUTOS = 10 * 60;
-const CINCO_MESES_SEGUNDOS = 150 * 24 * 60 * 60; // aproximação de 5 meses (30 dias cada)
 const JANELA_ANTECEDENCIA = 8 * 24 * 60 * 60; // olha pra frente até 8 dias (cron roda 1x por semana)
 
-async function renovarDescontoFixo(accessToken, shopId, db, clienteId){
-  const listaDescontos = await chamarShopee('/api/v2/discount/get_discount_list', {
-    access_token: accessToken, shop_id: shopId, discount_status: 'all', page_size: 100
-  }, 'GET', null, 'mkt');
-  const descontos = listaDescontos?.response?.discount_list || [];
-  const comEsseNome = descontos.filter(d => (d.discount_name || '').toLowerCase().includes(NOME_DESCONTO_FIXO));
-  if (!comEsseNome.length) return { renovado: false, motivo: 'Nenhum desconto com esse nome encontrado.' };
+// ===================== DESCONTO FIXO — lógica compartilhada (API v2.discount) =====================
+// Lê, lista e DUPLICA descontos de uma loja pela API da Shopee. Usado pelo botão do sistema (shopee.js)
+// e pela renovação automática (atualizar-gmv-cron.js). "chamar" é a função de chamada à Shopee já
+// configurada com o app Marketing: chamar(path, params, metodo, body).
+const DESC_CINCO_MESES = 150 * 24 * 60 * 60;   // duração do desconto novo (5 meses, regra da LB)
+const DESC_MARGEM_INICIO = 65 * 60;            // início mínimo no futuro (a Shopee não aceita início no passado)
+const DESC_DEZ_MINUTOS = 10 * 60;
+const DESC_LOTE_ITENS = 50;                    // produtos por chamada de add_discount_item
 
-  // Pega o que tem a data de término MAIS FUTURA entre os com esse nome (o "atual" ou já renovado mais recente)
-  const maisRecente = comEsseNome.reduce((a, b) => (a.end_time > b.end_time ? a : b));
+// Normaliza nome: minúsculo, sem acento, traços parecidos viram "-", espaços colapsados.
+function descNormalizarNome(s) {
+  return String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u2010-\u2015\u2212]/g, '-').replace(/\s+/g, ' ').trim();
+}
 
+// Data no formato do campo datetime-local do sistema (YYYY-MM-DDTHH:mm), sempre no horário de Brasília.
+function descFormatarDataLocalBR(unix) {
+  const partes = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+  }).formatToParts(new Date(unix * 1000));
+  const g = (t) => partes.find((p) => p.type === t).value;
+  return `${g('year')}-${g('month')}-${g('day')}T${g('hour')}:${g('minute')}`;
+}
+
+// Lista todos os descontos da loja (nome, período, status).
+async function descListar(chamar, ctx) {
+  const vistos = new Map();
+  for (let pagina = 1; pagina <= 5; pagina++) {
+    const r = await chamar('/api/v2/discount/get_discount_list', {
+      access_token: ctx.accessToken, shop_id: ctx.shopId, discount_status: 'all', page_no: pagina, page_size: 100
+    }, 'GET', null);
+    if (r?.error) {
+      if (pagina === 1) return { ok: false, erro: `${r.error}: ${r.message || ''}`.trim() };
+      break;
+    }
+    const lista = r?.response?.discount_list || [];
+    let novos = 0;
+    lista.forEach((d) => { if (!vistos.has(d.discount_id)) { vistos.set(d.discount_id, d); novos++; } });
+    if (!r?.response?.more || novos === 0) break;
+  }
+  return { ok: true, descontos: [...vistos.values()] };
+}
+
+// Lê UM desconto: dados + todos os produtos (paginando). soMeta=true lê só a primeira página.
+async function descLerDesconto(chamar, ctx, discountId, opcoes = {}) {
+  const POR_PAGINA = 100;
+  const itens = new Map();
+  let meta = null;
+  let offset = 0;
+  for (let pagina = 0; pagina < 30; pagina++) {
+    const r = await chamar('/api/v2/discount/get_discount', {
+      access_token: ctx.accessToken, shop_id: ctx.shopId, discount_id: discountId,
+      pagination_offset: offset, pagination_entries_per_page: POR_PAGINA
+    }, 'GET', null);
+    if (r?.error || !r?.response) {
+      if (pagina === 0) return { ok: false, erro: `${r?.error || 'sem resposta'} ${r?.message || ''}`.trim() };
+      break;
+    }
+    const resp = r.response;
+    if (!meta) {
+      meta = { discount_id: resp.discount_id ?? discountId, discount_name: resp.discount_name,
+               start_time: resp.start_time, end_time: resp.end_time, status: resp.status };
+    }
+    let novos = 0;
+    (resp.item_list || []).forEach((it) => { if (!itens.has(it.item_id)) { itens.set(it.item_id, it); novos++; } });
+    if (opcoes.soMeta || !resp.more || novos === 0) break;
+    offset += POR_PAGINA;
+  }
+  return { ok: true, meta, itens: [...itens.values()] };
+}
+
+// Converte os produtos lidos de um desconto no formato que o add_discount_item espera.
+function descMontarItensParaCopia(itensRaw) {
+  const itens = [];
+  const semPreco = [];
+  itensRaw.forEach((it) => {
+    const limite = it.purchase_limit || 0;
+    const modelos = (it.model_list || [])
+      .map((m) => ({ model_id: m.model_id, model_promotion_price: m.model_promotion_price ?? m.discount_price }))
+      .filter((m) => m.model_promotion_price !== undefined && m.model_promotion_price !== null);
+    if (modelos.length) {
+      itens.push({ item_id: it.item_id, purchase_limit: limite, model_list: modelos });
+    } else if (!(it.model_list || []).length && it.item_promotion_price !== undefined && it.item_promotion_price !== null) {
+      itens.push({ item_id: it.item_id, purchase_limit: limite, item_promotion_price: it.item_promotion_price });
+    } else {
+      semPreco.push(it.item_id);
+    }
+  });
+  return { itens, semPreco };
+}
+
+// Procura uma renovação que JÁ EXISTE (mesmo nome, termina depois) — ex.: alguém duplicou na mão no Seller Center.
+function descAcharSucessor(descontos, meta) {
+  const nome = descNormalizarNome(meta.discount_name);
+  return descontos
+    .filter((d) => String(d.discount_id) !== String(meta.discount_id)
+      && descNormalizarNome(d.discount_name) === nome && d.end_time > meta.end_time)
+    .sort((a, b) => b.end_time - a.end_time)[0] || null;
+}
+
+// DUPLICA um desconto: mesmo nome, mesmos produtos e preços, 5 meses.
+// Começa 10 min depois que o original acaba — ou daqui a ~1h se o original já venceu.
+// Se nenhum produto entrar, apaga o desconto vazio (rollback) pra não deixar a loja sem desconto.
+async function descDuplicar(chamar, ctx, discountId, opcoes = {}) {
+  const agora = opcoes.agora ?? Math.floor(Date.now() / 1000);
+  const lido = await descLerDesconto(chamar, ctx, discountId);
+  if (!lido.ok) return { ok: false, erro: `Não foi possível ler o desconto: ${lido.erro}` };
+  const { meta, itens } = lido;
+  if (!itens.length) return { ok: false, erro: 'Esse desconto não tem produtos pra copiar.' };
+
+  const { itens: paraCopiar, semPreco } = descMontarItensParaCopia(itens);
+  if (!paraCopiar.length) {
+    return { ok: false, erro: 'Não consegui ler os preços promocionais dos produtos desse desconto.', debugPrimeiroItem: itens[0] };
+  }
+
+  const novoInicio = Math.max(meta.end_time + DESC_DEZ_MINUTOS, agora + DESC_MARGEM_INICIO);
+  const novoFim = novoInicio + (opcoes.duracao ?? DESC_CINCO_MESES);
+
+  const criacao = await chamar('/api/v2/discount/add_discount', { access_token: ctx.accessToken, shop_id: ctx.shopId },
+    'POST', { discount_name: meta.discount_name, start_time: novoInicio, end_time: novoFim });
+  const novoId = criacao?.response?.discount_id;
+  if (!novoId) {
+    return { ok: false, erro: `Não foi possível criar o desconto novo: ${criacao?.error || ''} ${criacao?.message || ''}`.trim(), debugCriacao: criacao };
+  }
+
+  let adicionados = 0;
+  const falhas = [];
+  for (let i = 0; i < paraCopiar.length; i += DESC_LOTE_ITENS) {
+    const lote = paraCopiar.slice(i, i + DESC_LOTE_ITENS);
+    let r;
+    try {
+      r = await chamar('/api/v2/discount/add_discount_item', { access_token: ctx.accessToken, shop_id: ctx.shopId },
+        'POST', { discount_id: novoId, item_list: lote });
+    } catch (e) { falhas.push({ erro: 'chamada', mensagem: e.message }); continue; }
+    if (r?.error) { falhas.push({ erro: r.error, mensagem: r.message }); continue; }
+    const listaErros = r?.response?.error_list || [];
+    listaErros.forEach((e) => falhas.push(e));
+    adicionados += lote.length - new Set(listaErros.map((e) => e.item_id)).size;
+  }
+
+  if (adicionados === 0) {
+    let apagado = false;
+    try {
+      const d = await chamar('/api/v2/discount/delete_discount', { access_token: ctx.accessToken, shop_id: ctx.shopId },
+        'POST', { discount_id: novoId });
+      apagado = !d?.error;
+    } catch (e) { /* segue: já vamos avisar que precisa apagar na mão */ }
+    return {
+      ok: false, rollback: apagado, falhas: falhas.slice(0, 5),
+      erro: `Nenhum produto foi adicionado ao desconto novo. ${apagado ? 'O desconto vazio foi apagado automaticamente.' : `ATENÇÃO: o desconto vazio (id ${novoId}) ficou na Shopee — apague na mão.`}`
+    };
+  }
+
+  return {
+    ok: true, novoDiscountId: novoId, nome: meta.discount_name, novoInicio, novoFim,
+    totalProdutos: adicionados, totalOrigem: itens.length, semPreco, falhas: falhas.slice(0, 5),
+    duracaoDias: Math.round((novoFim - novoInicio) / 86400)
+  };
+}
+// =================== FIM — DESCONTO FIXO (lógica compartilhada) ===================
+
+// Renova o desconto fixo de UM cliente, a partir do desconto que a equipe MARCOU no sistema
+// (campo shopeeDescontoFixoId, aba Shopee > Descontos). Não adivinha por nome: sem desconto marcado, pula e registra.
+async function renovarDescontoFixo(accessToken, shopId, db, cliente){
+  const ctx = { accessToken, shopId };
+  const chamar = (path, params, metodo = 'GET', body = null) => chamarShopee(path, params, metodo, body, 'mkt');
+  const refId = cliente.shopeeDescontoFixoId;
+  if (!refId) return { renovado: false, motivo: 'Sem desconto fixo marcado no sistema (Shopee > Descontos). Pulado.' };
+
+  const lido = await descLerDesconto(chamar, ctx, refId, { soMeta: true });
+  if (!lido.ok) return { renovado: false, motivo: `Desconto marcado não encontrado na Shopee (${lido.erro}). Marque de novo no sistema.` };
+  const meta = lido.meta;
   const agora = Math.floor(Date.now() / 1000);
-  if (maisRecente.end_time - agora > JANELA_ANTECEDENCIA) {
-    return { renovado: false, motivo: 'Ainda não está perto de vencer.', vigenteAte: maisRecente.end_time };
+
+  // Mantém o quadro de datas do sistema igual à realidade da Shopee.
+  const atualizacao = {};
+  const dataReal = descFormatarDataLocalBR(meta.end_time);
+  if (cliente.descontoFixoFim !== dataReal) atualizacao.descontoFixoFim = dataReal;
+  if (meta.discount_name && cliente.shopeeDescontoFixoNome !== meta.discount_name) atualizacao.shopeeDescontoFixoNome = meta.discount_name;
+  const salvar = async () => { if (Object.keys(atualizacao).length) await db.collection('clientes').doc(cliente.id).update(atualizacao); };
+
+  if (meta.end_time - agora > JANELA_ANTECEDENCIA) {
+    await salvar();
+    return { renovado: false, motivo: 'Ainda não está perto de vencer.', vigenteAte: meta.end_time };
   }
 
-  // Já existe um próximo agendado começando logo depois desse? Então já foi renovado, não duplica.
-  const jaTemProximo = comEsseNome.some(d => d.discount_id !== maisRecente.discount_id && d.start_time >= maisRecente.end_time);
-  if (jaTemProximo) {
-    return { renovado: false, motivo: 'Já existe uma renovação agendada.' };
+  // Alguém já renovou na mão (ex.: botão Duplicar do Seller Center)? Adota como referência em vez de duplicar de novo.
+  const todos = await descListar(chamar, ctx);
+  if (todos.ok) {
+    const sucessor = descAcharSucessor(todos.descontos, meta);
+    if (sucessor) {
+      atualizacao.shopeeDescontoFixoId = String(sucessor.discount_id);
+      atualizacao.shopeeDescontoFixoNome = sucessor.discount_name;
+      atualizacao.descontoFixoFim = descFormatarDataLocalBR(sucessor.end_time);
+      await salvar();
+      return { renovado: false, motivo: 'Já existia uma renovação — adotada como o novo desconto fixo.', novoDiscountId: sucessor.discount_id };
+    }
   }
 
-  // Busca os produtos e preços do desconto atual, pra copiar pro novo
-  const detalheAtual = await chamarShopee('/api/v2/discount/get_discount', {
-    access_token: accessToken, shop_id: shopId, discount_id: maisRecente.discount_id
-  }, 'GET', null, 'mkt');
-  const itensAtuais = detalheAtual?.response?.item_list || [];
-  if (!itensAtuais.length) return { renovado: false, motivo: 'Desconto encontrado, mas sem produtos pra copiar.' };
-
-  const novoInicio = maisRecente.end_time + DEZ_MINUTOS;
-  const novoFim = novoInicio + CINCO_MESES_SEGUNDOS;
-
-  // Cria a "casca" do desconto novo, com o mesmo nome
-  const criacao = await chamarShopee('/api/v2/discount/add_discount', {
-    access_token: accessToken, shop_id: shopId
-  }, 'POST', { discount_name: maisRecente.discount_name, start_time: novoInicio, end_time: novoFim }, 'mkt');
-  const novoDiscountId = criacao?.response?.discount_id;
-  if (!novoDiscountId) {
-    return { renovado: false, motivo: `Não foi possível criar o desconto novo: ${criacao?.error || ''} ${criacao?.message || ''}` };
+  const r = await descDuplicar(chamar, ctx, refId, { agora });
+  if (!r.ok) {
+    await salvar();
+    return { renovado: false, motivo: r.erro, detalhe: r };
   }
 
-  // Copia os produtos e preços pro desconto novo
-  const itensParaAdicionar = itensAtuais.map(it => ({
-    item_id: it.item_id,
-    purchase_limit: it.purchase_limit || 0,
-    discount_price: it?.model_list?.[0]?.discount_price ?? it.item_promotion_price ?? undefined
-  })).filter(it => it.discount_price !== undefined);
-
-  const adicaoItens = await chamarShopee('/api/v2/discount/add_discount_item', {
-    access_token: accessToken, shop_id: shopId
-  }, 'POST', { discount_id: novoDiscountId, item_list: itensParaAdicionar }, 'mkt');
-
-  // Salva no Firestore quando foi renovado e até quando vale, pra aparecer na aba Descontos
-  if (db && clienteId) {
-    await db.collection('clientes').doc(clienteId).update({
-      descontoAutoUltimaRenovacao: new Date(),
-      descontoAutoProximoVencimento: novoFim * 1000,
-      descontoAutoTotalProdutos: itensParaAdicionar.length
-    });
-  }
-
-  return { renovado: true, novoDiscountId, novoInicio, novoFim, totalProdutos: itensParaAdicionar.length, debugAdicaoItens: adicaoItens };
+  await db.collection('clientes').doc(cliente.id).update({
+    shopeeDescontoFixoId: String(r.novoDiscountId),
+    shopeeDescontoFixoNome: r.nome,
+    descontoFixoFim: descFormatarDataLocalBR(r.novoFim),
+    descontoAutoUltimaRenovacao: new Date(),
+    descontoAutoProximoVencimento: r.novoFim * 1000,
+    descontoAutoTotalProdutos: r.totalProdutos
+  });
+  return { renovado: true, novoDiscountId: r.novoDiscountId, novoInicio: r.novoInicio, novoFim: r.novoFim,
+           totalProdutos: r.totalProdutos, totalOrigem: r.totalOrigem, falhas: r.falhas };
 }
 
 // Gera um código de até 5 caracteres (A-Z, 0-9) a partir do nome do cliente + um sufixo
@@ -294,7 +444,7 @@ async function garantirOfertaRelampago(accessTokenMkt, shopIdMkt, accessTokenGmv
       }, 'GET', null, 'mkt');
       const itensDesconto = detalheDesconto?.response?.item_list || [];
       itensDesconto.forEach(di => {
-        const precoComDesconto = di?.model_list?.[0]?.discount_price ?? di?.item_promotion_price;
+        const precoComDesconto = di?.model_list?.[0]?.model_promotion_price ?? di?.model_list?.[0]?.discount_price ?? di?.item_promotion_price;
         if (precoComDesconto) mapaDescontoAtivo[di.item_id] = precoComDesconto;
       });
     }
@@ -443,10 +593,11 @@ async function salvarDiasNoFirestore(db, clienteId, porDia){
   await batch.commit();
 }
 
-// Soma os dias já salvos que caem dentro da janela móvel de 30 dias — sem chamar a Shopee.
-async function somarUltimos30Dias(db, clienteId, hoje){
+// Soma os dias já salvos do mês calendário atual — sem chamar a Shopee.
+async function somarMesAtual(db, clienteId, hoje){
   const snap = await db.collection('clientes').doc(clienteId).collection('gmvDiario').get();
-  const limiteInicio = fmtDia(new Date(hoje.getTime() - 29 * 24 * 60 * 60 * 1000));
+  // Mês calendário de verdade: do dia 1º do mês atual até hoje (não mais 30 dias corridos)
+  const limiteInicio = fmtDia(new Date(hoje.getFullYear(), hoje.getMonth(), 1));
   const hojeStr = fmtDia(hoje);
   let gmv = 0, totalPedidos = 0;
   snap.docs.forEach(d => {
@@ -502,7 +653,7 @@ export default async function handler(req, res) {
     const hojeStr = fmtDia(hoje);
     const MARGEM_DIAS = 7;
     const inicioMargem = fmtDia(new Date(hoje.getTime() - (MARGEM_DIAS - 1) * 24 * 60 * 60 * 1000));
-    const inicioHistoricoCompleto = fmtDia(new Date(hoje.getTime() - 29 * 24 * 60 * 60 * 1000));
+    const inicioHistoricoCompleto = fmtDia(new Date(hoje.getFullYear(), hoje.getMonth(), 1)); // dia 1º do mês atual
 
     const snapshot = await db.collection('clientes').where('shopeeShopId', '!=', null).get();
     const resultados = [];
@@ -523,7 +674,7 @@ export default async function handler(req, res) {
         const { porDia, totalPedidos } = await buscarGmvPorDia(accessToken, cliente.shopeeShopId, periodoInicio, hojeStr);
 
         await salvarDiasNoFirestore(db, cliente.id, porDia);
-        const { gmv: gmvFinal, totalPedidos: totalPedidosFinal } = await somarUltimos30Dias(db, cliente.id, hoje);
+        const { gmv: gmvFinal, totalPedidos: totalPedidosFinal } = await somarMesAtual(db, cliente.id, hoje);
 
         // Únicos campos que o frontend lê — continuam exatamente com o mesmo nome/formato de sempre.
         await db.collection('clientes').doc(cliente.id).update({
@@ -535,7 +686,7 @@ export default async function handler(req, res) {
         console.log(
           `[GMV CRON] CLIENTE: ${cliente.nome} | MODO: ${modo} | PERIODO: ${periodoInicio} a ${hojeStr} | ` +
           `PEDIDOS ENCONTRADOS: ${totalPedidos} | GMV CALCULADO (periodo): ${gmvPeriodo.toFixed(2)} | ` +
-          `GMV FINAL 30 DIAS: ${gmvFinal.toFixed(2)}`
+          `GMV FINAL MÊS ATUAL: ${gmvFinal.toFixed(2)}`
         );
 
         resultados.push({ cliente: cliente.nome, modo, ok: true, gmv: gmvFinal, totalPedidos: totalPedidosFinal });
@@ -550,7 +701,8 @@ export default async function handler(req, res) {
       if (cliente.shopeeMktShopId) {
         try {
           const accessTokenMkt = await garantirTokenValidoMkt(db, cliente);
-          const resultadoDesconto = await renovarDescontoFixo(accessTokenMkt, cliente.shopeeMktShopId, db, cliente.id);
+          const resultadoDesconto = await renovarDescontoFixo(accessTokenMkt, cliente.shopeeMktShopId, db, cliente);
+          console.log(`[DESCONTO FIXO] ${cliente.nome}: ${resultadoDesconto.renovado ? 'RENOVADO' : 'não renovado'} — ${resultadoDesconto.motivo || (resultadoDesconto.totalProdutos + ' produto(s) copiado(s)')}`);
           resultados.push({ cliente: cliente.nome, tipo: 'desconto_fixo', ...resultadoDesconto, ok: true });
           try {
             const resultadoCupom = await renovarCupomFixo(accessTokenMkt, cliente.shopeeMktShopId, db, cliente.id, cliente.nome);
