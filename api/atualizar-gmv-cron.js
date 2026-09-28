@@ -273,6 +273,17 @@ const OFR_MARGEM_INICIO = 120; // a Shopee recusa início no passado: a busca de
 
 function ofrArredondar(v) { return Math.round(v * 100) / 100; }
 
+// A Shopee recusa a chamada quando a LOJA não atende às regras da Oferta Relâmpago da Loja (não é problema de permissão do app).
+function ofrErroAmigavel(resp, contexto) {
+  if (/not_meet_shop_criteria/.test(String(resp?.error || ''))) {
+    return {
+      naoElegivel: true,
+      erro: 'A Shopee recusou: essa loja ainda não atende aos requisitos da Oferta Relâmpago da Loja (regra da própria Shopee sobre a loja, não do sistema). Confira no Seller Center dessa loja, em Central de Marketing > Oferta Relâmpago da Loja, se ela consegue criar uma oferta por lá.'
+    };
+  }
+  return { erro: `${contexto}: ${resp?.error || ''} ${resp?.message || ''}`.trim() };
+}
+
 // Lê o(s) desconto(s) em andamento e devolve até "limite" produtos com preço promocional já calculado.
 async function descItensParaOfertaRelampago(chamar, ctx, { discountId, percentual, qtdPorProduto, limite }) {
   const agora = Math.floor(Date.now() / 1000);
@@ -331,61 +342,126 @@ function ofrMontarItens(itens, qtd, formatoSimples) {
   });
 }
 
-// Cria a oferta relâmpago no próximo horário livre que a Shopee liberou. Se nenhum produto entrar, apaga a oferta vazia.
-async function descCriarOfertaRelampago(chamar, ctx, opcoes = {}) {
+// Todos os horários que a Shopee liberou, em janelas de 7 dias (até ~28 dias à frente).
+const OFR_JANELA_DIAS = 7;
+const OFR_MAX_JANELAS = 4;
+async function descListarHorariosOferta(chamar, ctx, desde) {
+  const base = { access_token: ctx.accessToken, shop_id: ctx.shopId };
+  const slots = new Map();
+  for (let j = 0; j < OFR_MAX_JANELAS; j++) {
+    const ini = desde + j * OFR_JANELA_DIAS * 86400;
+    const r = await chamar('/api/v2/shop_flash_sale/get_time_slot_id', { ...base, start_time: ini, end_time: ini + OFR_JANELA_DIAS * 86400 }, 'GET', null);
+    if (r?.error) { if (j === 0) return { ok: false, resp: r }; break; } // erro em janela distante: fica com o que já achou
+    (Array.isArray(r?.response) ? r.response : []).forEach((s) => { if (s.timeslot_id && !slots.has(s.timeslot_id)) slots.set(s.timeslot_id, s); });
+  }
+  return { ok: true, slots: [...slots.values()].sort((x, y) => x.start_time - y.start_time) };
+}
+
+// Ofertas relâmpago que a loja JÁ TEM (agendadas e em andamento), pra não repetir horário.
+async function descOfertasExistentes(chamar, ctx) {
+  const base = { access_token: ctx.accessToken, shop_id: ctx.shopId };
+  const lista = [];
+  let algumaOk = false;
+  for (const type of [1, 2]) {
+    try {
+      const r = await chamar('/api/v2/shop_flash_sale/get_shop_flash_sale_list', { ...base, type, offset: 0, limit: 100 }, 'GET', null);
+      if (!r?.error) { algumaOk = true; (r?.response?.flash_sale_list || []).forEach((f) => lista.push(f)); }
+    } catch (e) { /* tenta o outro tipo */ }
+  }
+  return { lista, confiavel: algumaOk };
+}
+
+// Cada horário recebe um grupo diferente de produtos (roda pelo catálogo do desconto), sem repetir entre horários.
+function ofrFatia(itens, indice, limite) {
+  if (itens.length <= limite) return itens;
+  const ini = (indice * limite) % itens.length;
+  const fatia = [];
+  for (let k = 0; k < limite; k++) fatia.push(itens[(ini + k) % itens.length]);
+  return fatia;
+}
+
+// Cria uma oferta relâmpago em CADA horário livre que a Shopee liberou (até maxHorarios).
+// Horário que a loja já tem é pulado; se nenhum produto entrar num horário, a oferta vazia é apagada;
+// depois de 2 horários seguidos sem sucesso, para (evita insistir num erro que se repete).
+async function descCriarOfertasRelampago(chamar, ctx, opcoes = {}) {
   const percentual = opcoes.percentual ?? 5;
   const qtd = opcoes.qtdPorProduto ?? 5;
   const limite = Math.min(opcoes.limite ?? 20, 20);
+  const maxHorarios = Math.max(1, Math.min(opcoes.maxHorarios ?? 14, 30));
   const base = { access_token: ctx.accessToken, shop_id: ctx.shopId };
 
-  const origem = await descItensParaOfertaRelampago(chamar, ctx, { discountId: opcoes.discountId, percentual, qtdPorProduto: qtd, limite });
+  const origem = await descItensParaOfertaRelampago(chamar, ctx, { discountId: opcoes.discountId, percentual, qtdPorProduto: qtd, limite: Infinity });
   if (!origem.ok) return { ok: false, erro: origem.erro };
 
-  // Não sobrepor ofertas que a loja já tem (agendadas/em andamento): procura horário depois da última.
-  let desde = Math.floor(Date.now() / 1000) + OFR_MARGEM_INICIO;
-  try {
-    const existentes = await chamar('/api/v2/shop_flash_sale/get_shop_flash_sale_list', { ...base, type: 1, offset: 0, limit: 100 }, 'GET', null);
-    (existentes?.response?.flash_sale_list || []).forEach((f) => { if (f.end_time && f.end_time + 60 > desde) desde = f.end_time + 60; });
-  } catch (e) { /* segue a partir de agora */ }
-
-  const horarios = await chamar('/api/v2/shop_flash_sale/get_time_slot_id', { ...base, start_time: desde, end_time: desde + 7 * 86400 }, 'GET', null);
-  if (horarios?.error) {
-    return { ok: false, erro: `Não foi possível buscar os horários: ${horarios.error} ${horarios.message || ''}`.trim(), debugHorarios: horarios };
-  }
-  const slot = horarios?.response?.[0]?.timeslot_id;
-  if (!slot) {
-    return { ok: false, semHorario: true, erro: 'Nenhum horário disponível na Shopee pros próximos 7 dias (considerando as ofertas que a loja já tem).', debugHorarios: horarios };
+  const desde = Math.floor(Date.now() / 1000) + OFR_MARGEM_INICIO;
+  const horarios = await descListarHorariosOferta(chamar, ctx, desde);
+  if (!horarios.ok) return { ok: false, ...ofrErroAmigavel(horarios.resp, 'Não foi possível buscar os horários'), debugHorarios: horarios.resp };
+  if (!horarios.slots.length) {
+    return { ok: false, semHorario: true, erro: 'A Shopee ainda não liberou nenhum horário de oferta relâmpago pros próximos dias.' };
   }
 
-  const criacao = await chamar('/api/v2/shop_flash_sale/create_shop_flash_sale', base, 'POST', { timeslot_id: slot });
-  const flashSaleId = criacao?.response?.flash_sale_id;
-  if (!flashSaleId) {
-    return { ok: false, erro: `Não foi possível criar a oferta relâmpago: ${criacao?.error || ''} ${criacao?.message || ''}`.trim(), debugCriacao: criacao };
+  const existentes = await descOfertasExistentes(chamar, ctx);
+  const ocupado = (s) => existentes.lista.some((f) => (f.timeslot_id && f.timeslot_id === s.timeslot_id)
+    || (f.start_time && f.end_time && f.start_time < s.end_time && f.end_time > s.start_time));
+  const livres = horarios.slots.filter((s) => !ocupado(s));
+  if (!livres.length) {
+    return { ok: false, semHorario: true, jaTemTodas: true, erro: 'A loja já tem oferta relâmpago em todos os horários que a Shopee liberou.', horariosEncontrados: horarios.slots.length };
   }
 
-  const adicionar = (formato) => chamar('/api/v2/shop_flash_sale/add_shop_flash_sale_items', base, 'POST',
-    { flash_sale_id: flashSaleId, items: ofrMontarItens(origem.itens, qtd, formato) });
-  const listaFalhas = (r) => { const l = r?.response?.failed_items ?? r?.response?.failed_list ?? []; return Array.isArray(l) ? l : []; };
+  const criadas = [];
+  const puladas = [];
+  const falhasItens = [];
+  let formato = 'item';
+  let semSucessoSeguidos = 0;
+  const deslocamento = existentes.lista.length; // ofertas que a loja já tem empurram a rotação de produtos
 
-  let adicao = await adicionar('item');
-  let formatoUsado = 'item';
-  const temSimples = origem.itens.some((i) => i.simples);
-  if (temSimples && (adicao?.error || listaFalhas(adicao).length >= origem.itens.length)) {
-    adicao = await adicionar('models');
-    formatoUsado = 'models';
-  }
-  const falhas = listaFalhas(adicao);
-  const adicionados = adicao?.error ? 0 : Math.max(origem.itens.length - falhas.length, 0);
+  for (const slot of livres.slice(0, maxHorarios)) {
+    const inicioTxt = descFormatarDataLocalBR(slot.start_time);
+    const criacao = await chamar('/api/v2/shop_flash_sale/create_shop_flash_sale', base, 'POST', { timeslot_id: slot.timeslot_id });
+    const flashSaleId = criacao?.response?.flash_sale_id;
+    if (!flashSaleId) {
+      const e = ofrErroAmigavel(criacao, 'Não foi possível criar a oferta');
+      if (e.naoElegivel && !criadas.length) return { ok: false, ...e, debugCriacao: criacao };
+      puladas.push({ timeslotId: slot.timeslot_id, inicio: inicioTxt, motivo: e.erro });
+      if (++semSucessoSeguidos >= 2) break;
+      continue;
+    }
 
-  if (adicionados === 0) {
-    let apagada = false;
-    try { const d = await chamar('/api/v2/shop_flash_sale/delete_shop_flash_sale', base, 'POST', { flash_sale_id: flashSaleId }); apagada = !d?.error; } catch (e) { /* avisa abaixo */ }
-    return {
-      ok: false, rollback: apagada, debugAdicao: adicao, falhas: falhas.slice(0, 5),
-      erro: `A Shopee não aceitou nenhum produto${adicao?.error ? ` (${adicao.error}: ${adicao.message || ''})` : ''}. ${apagada ? 'A oferta vazia foi apagada automaticamente.' : `ATENÇÃO: a oferta vazia (id ${flashSaleId}) ficou na Shopee — apague na mão.`}`
-    };
+    const fatia = ofrFatia(origem.itens, deslocamento + criadas.length + puladas.length, limite);
+    const adicionar = (f) => chamar('/api/v2/shop_flash_sale/add_shop_flash_sale_items', base, 'POST',
+      { flash_sale_id: flashSaleId, items: ofrMontarItens(fatia, qtd, f) });
+    const listaFalhas = (r) => { const l = r?.response?.failed_items ?? r?.response?.failed_list ?? []; return Array.isArray(l) ? l : []; };
+
+    let adicao = await adicionar(formato);
+    if (fatia.some((i) => i.simples) && (adicao?.error || listaFalhas(adicao).length >= fatia.length)) {
+      const outro = formato === 'item' ? 'models' : 'item';
+      const adicao2 = await adicionar(outro);
+      const ok2 = !adicao2?.error && listaFalhas(adicao2).length < fatia.length;
+      if (ok2) { adicao = adicao2; formato = outro; }
+    }
+    const falhas = listaFalhas(adicao);
+    const adicionados = adicao?.error ? 0 : Math.max(fatia.length - falhas.length, 0);
+    falhas.forEach((f) => falhasItens.push(f));
+
+    if (adicionados === 0) {
+      let apagada = false;
+      try { const d = await chamar('/api/v2/shop_flash_sale/delete_shop_flash_sale', base, 'POST', { flash_sale_id: flashSaleId }); apagada = !d?.error; } catch (e) { /* avisa abaixo */ }
+      puladas.push({ timeslotId: slot.timeslot_id, inicio: inicioTxt, motivo: `A Shopee não aceitou nenhum produto${adicao?.error ? ` (${adicao.error}: ${adicao.message || ''})` : ''}. ${apagada ? 'Oferta vazia apagada.' : `ATENÇÃO: oferta vazia ${flashSaleId} ficou na Shopee — apague na mão.`}` });
+      if (++semSucessoSeguidos >= 2) break;
+      continue;
+    }
+    semSucessoSeguidos = 0;
+    criadas.push({ flashSaleId, timeslotId: slot.timeslot_id, inicio: inicioTxt, fim: descFormatarDataLocalBR(slot.end_time), totalProdutos: adicionados, falhas: falhas.slice(0, 3) });
   }
-  return { ok: true, flashSaleId, timeslotId: slot, totalProdutos: adicionados, falhas: falhas.slice(0, 5), formatoUsado, resultadoItens: adicao };
+
+  const totalProdutos = criadas.reduce((s, o) => s + o.totalProdutos, 0);
+  const resumo = { criadas, puladas, totalOfertas: criadas.length, totalProdutos, horariosEncontrados: horarios.slots.length,
+    jaExistiam: horarios.slots.length - livres.length, formatoUsado: formato, falhas: falhasItens.slice(0, 5),
+    flashSaleId: criadas[0]?.flashSaleId, timeslotId: criadas[0]?.timeslotId };
+  if (!criadas.length) {
+    return { ok: false, ...resumo, erro: `Nenhuma oferta foi criada. ${puladas.slice(0, 2).map((p) => `${p.inicio}: ${p.motivo}`).join(' | ')}` };
+  }
+  return { ok: true, ...resumo };
 }
 
 // =================== FIM — DESCONTO FIXO (lógica compartilhada) ===================
@@ -534,18 +610,56 @@ async function renovarCupomFixo(accessToken, shopId, db, clienteId, nomeCliente)
 }
 }
 
-// Garante que a loja sempre tem uma Oferta Relâmpago agendada. Segue exatamente as datas/horários
-// que a PRÓPRIA SHOPEE libera (não tem cadência fixa tipo "toda terça") — busca o próximo horário
-// livre depois da última oferta já agendada, e se não tiver nenhum disponível ainda, não faz nada
-// (tenta de novo automaticamente na próxima semana).
-// Produtos e preço vêm do desconto fixo da loja (app Marketing) — o app GMV não tem permissão de produto.
-async function garantirOfertaRelampago(accessTokenMkt, shopIdMkt, cliente){
+// Garante que a loja tem oferta relâmpago em TODOS os horários que a Shopee liberou. Horário que a loja
+// já tem é pulado, então rodar todo dia não duplica nada. Produtos e preço vêm do desconto fixo (app Marketing).
+async function garantirOfertasRelampago(accessTokenMkt, shopIdMkt, cliente){
   const chamar = (path, params, metodo = 'GET', body = null) => chamarShopee(path, params, metodo, body, 'mkt');
-  const r = await descCriarOfertaRelampago(chamar, { accessToken: accessTokenMkt, shopId: shopIdMkt }, {
-    discountId: cliente.shopeeDescontoFixoId || undefined, percentual: 5, qtdPorProduto: 5, limite: 20
+  const r = await descCriarOfertasRelampago(chamar, { accessToken: accessTokenMkt, shopId: shopIdMkt }, {
+    discountId: cliente.shopeeDescontoFixoId || undefined, percentual: 5, qtdPorProduto: 5, limite: 20, maxHorarios: 14
   });
-  if (!r.ok) return { criado: false, motivo: r.erro, semHorario: !!r.semHorario };
-  return { criado: true, flashSaleId: r.flashSaleId, timeslotId: r.timeslotId, totalProdutos: r.totalProdutos, falhas: r.falhas };
+  if (!r.ok) return { criado: false, motivo: r.erro, semHorario: !!r.semHorario, jaTemTodas: !!r.jaTemTodas, naoElegivel: !!r.naoElegivel };
+  return { criado: true, totalOfertas: r.totalOfertas, totalProdutos: r.totalProdutos, puladas: r.puladas.length, motivo: `${r.totalOfertas} oferta(s) criada(s) (${r.totalProdutos} produto(s))${r.puladas.length ? `, ${r.puladas.length} horário(s) pulado(s)` : ''}` };
+}
+
+// MODO DIÁRIO DE OFERTAS (?modo=ofertas): passa por TODO cliente com Marketing conectado — não depende do app GMV —,
+// começando pelo verificado há mais tempo. Tem limite de tempo (a função da Vercel para em 60s): quem não der tempo
+// hoje fica no começo da fila de amanhã. Loja que a Shopee marcou como não elegível só é revisada de novo em 7 dias.
+async function rodarOfertasRelampago(db, res){
+  const INICIO = Date.now();
+  const ORCAMENTO_MS = 45000;
+  const SETE_DIAS_MS = 7 * 24 * 60 * 60 * 1000;
+  const snapshot = await db.collection('clientes').where('shopeeMktShopId', '!=', null).get();
+  const clientes = snapshot.docs.map(d => ({ id: d.id, ...d.data() }))
+    .filter(c => c.shopeeMktShopId && c.ativo !== false)
+    .sort((a, b) => (a.ofertaRelampagoUltimaVerificacao || 0) - (b.ofertaRelampagoUltimaVerificacao || 0));
+  const resultados = [];
+  let verificados = 0, ofertasCriadas = 0, aguardando = 0;
+  for (const cliente of clientes) {
+    if (Date.now() - INICIO > ORCAMENTO_MS) { aguardando++; continue; }
+    if ((cliente.ofertaRelampagoNaoElegivelAte || 0) > Date.now()) {
+      resultados.push({ cliente: cliente.nome, pulado: 'Loja não elegível pra oferta relâmpago (Shopee) — revisão em até 7 dias.' });
+      continue;
+    }
+    const atualizacao = { ofertaRelampagoUltimaVerificacao: Date.now() };
+    try {
+      const accessTokenMkt = await garantirTokenValidoMkt(db, cliente);
+      const r = await garantirOfertasRelampago(accessTokenMkt, cliente.shopeeMktShopId, cliente);
+      atualizacao.ofertaRelampagoAutoUltimoResultado = String(r.motivo || '').slice(0, 220);
+      if (r.criado) { atualizacao.ofertaRelampagoAutoUltimaCriacao = new Date(); ofertasCriadas += r.totalOfertas; }
+      if (r.naoElegivel) atualizacao.ofertaRelampagoNaoElegivelAte = Date.now() + SETE_DIAS_MS;
+      else if (cliente.ofertaRelampagoNaoElegivelAte) atualizacao.ofertaRelampagoNaoElegivelAte = null;
+      console.log(`[OFERTAS CRON] ${cliente.nome}: ${r.criado ? 'CRIOU' : 'não criou'} — ${r.motivo || ''}`);
+      resultados.push({ cliente: cliente.nome, ...r });
+    } catch (e) {
+      atualizacao.ofertaRelampagoAutoUltimoResultado = `Erro: ${e.message}`.slice(0, 220);
+      console.error(`[OFERTAS CRON] ERRO — ${cliente.nome}: ${e.message}`);
+      resultados.push({ cliente: cliente.nome, erro: e.message });
+    }
+    verificados++;
+    try { await db.collection('clientes').doc(cliente.id).update(atualizacao); } catch (e) { console.error('[OFERTAS CRON] não salvou estado:', e.message); }
+  }
+  console.log(`[OFERTAS CRON] verificados: ${verificados} | ofertas criadas: ${ofertasCriadas} | ficaram pra amanhã: ${aguardando} | chamadas Shopee: ${CONTADOR_CHAMADAS_SHOPEE}`);
+  return res.status(200).json({ ok: true, modo: 'ofertas', totalClientes: clientes.length, verificados, ofertasCriadas, aguardando, resultados });
 }
 // Busca pedidos no período pedido e retorna o GMV JÁ SEPARADO POR DIA (create_time),
 // pra dar pra salvar cada dia individualmente no Firestore (gmvDiario).
@@ -681,6 +795,12 @@ export default async function handler(req, res) {
 
   const db = getDb();
 
+  if (req.query?.modo === 'ofertas') {
+    CONTADOR_CHAMADAS_SHOPEE = 0;
+    try { return await rodarOfertasRelampago(db, res); }
+    catch (e) { console.error('[OFERTAS CRON] falha geral:', e); return res.status(500).json({ ok: false, erro: e.message }); }
+  }
+
   const lockOk = await adquirirLock(db);
   if (!lockOk) {
     console.log('[GMV CRON] Abortado — já existe uma execução em andamento (lock ativo há menos de 10min).');
@@ -749,13 +869,6 @@ export default async function handler(req, res) {
             resultados.push({ cliente: cliente.nome, tipo: 'cupom_fixo', ...resultadoCupom, ok: true });
           } catch (eCupom) {
             resultados.push({ cliente: cliente.nome, tipo: 'cupom_fixo', erro: eCupom.message, ok: false });
-          }
-          try {
-            const resultadoOferta = await garantirOfertaRelampago(accessTokenMkt, cliente.shopeeMktShopId, cliente);
-            console.log(`[OFERTA RELÂMPAGO] ${cliente.nome}: ${resultadoOferta.criado ? 'CRIADA (' + resultadoOferta.totalProdutos + ' produto(s))' : 'não criada'} — ${resultadoOferta.motivo || ''}`);
-            resultados.push({ cliente: cliente.nome, tipo: 'oferta_relampago', ...resultadoOferta, ok: true });
-          } catch (eOferta) {
-            resultados.push({ cliente: cliente.nome, tipo: 'oferta_relampago', erro: eOferta.message, ok: false });
           }
         } catch (e) {
           resultados.push({ cliente: cliente.nome, tipo: 'desconto_fixo', erro: e.message, ok: false });
