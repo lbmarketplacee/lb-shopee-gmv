@@ -3,6 +3,10 @@
     {
       "path": "/api/atualizar-gmv-cron",
       "schedule": "0 10 * * 1"
+    },
+    {
+      "path": "/api/atualizar-gmv-cron?modo=ofertas",
+      "schedule": "0 12 * * *"
     }
   ],
   "functions": {
