@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Intermediário seguro LB para integração com a Shopee Open Platform (GMV + Marketing)",
   "private": true,
+  "type": "module",
   "dependencies": {
     "https-proxy-agent": "^7.0.5",
     "firebase-admin": "^12.0.0"
