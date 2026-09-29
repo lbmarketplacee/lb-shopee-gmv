@@ -681,8 +681,11 @@ async function renovarCupomFixo(accessToken, shopId, db, clienteId, nomeCliente)
 // já tem é pulado, então rodar todo dia não duplica nada. Produtos e preço vêm do desconto fixo (app Marketing).
 async function garantirOfertasRelampago(accessTokenMkt, shopIdMkt, cliente){
   const chamar = (path, params, metodo = 'GET', body = null) => chamarShopee(path, params, metodo, body, 'mkt');
+  // maxHorarios baixo de propósito aqui: o robô roda TODO dia e nunca recria horário já preenchido,
+  // então o resto vai sendo completado nos próximos dias sem risco de estourar o tempo da função (60s,
+  // com vários clientes na mesma execução). O botão manual (shopee.js) não tem esse limite.
   const r = await descCriarOfertasRelampago(chamar, { accessToken: accessTokenMkt, shopId: shopIdMkt }, {
-    discountId: cliente.shopeeDescontoFixoId || undefined, percentual: 5, qtdPorProduto: 5, limite: 20, maxHorarios: 14
+    discountId: cliente.shopeeDescontoFixoId || undefined, percentual: 5, qtdPorProduto: 5, limite: 20, maxHorarios: 4
   });
   if (!r.ok) return { criado: false, motivo: r.erro, semHorario: !!r.semHorario, jaTemTodas: !!r.jaTemTodas, naoElegivel: !!r.naoElegivel };
   return { criado: true, totalOfertas: r.totalOfertas, totalProdutos: r.totalProdutos, puladas: r.puladas.length, motivo: `${r.totalOfertas} oferta(s) criada(s) (${r.totalProdutos} produto(s))${r.puladas.length ? `, ${r.puladas.length} horário(s) pulado(s)` : ''}${r.motivos ? ` | recusas: ${r.motivos}` : ''}` };
@@ -702,7 +705,7 @@ async function registrarErroOferta(db, clienteNome, acao, mensagem){
 
 async function rodarOfertasRelampago(db, res){
   const INICIO = Date.now();
-  const ORCAMENTO_MS = 45000;
+  const ORCAMENTO_MS = 30000; // folga maior até o limite de 60s da função — um cliente sozinho pode demorar
   const SETE_DIAS_MS = 7 * 24 * 60 * 60 * 1000;
   const snapshot = await db.collection('clientes').where('shopeeMktShopId', '!=', null).get();
   const clientes = snapshot.docs.map(d => ({ id: d.id, ...d.data() }))
