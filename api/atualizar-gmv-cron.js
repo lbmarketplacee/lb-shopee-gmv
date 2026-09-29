@@ -425,6 +425,22 @@ function ofrFatia(itens, indice, limite, excluir) {
   return fatia;
 }
 
+// Consulta as ofertas relâmpago que a loja JÁ TEM na Shopee agora (agendadas + em andamento), sem criar nada.
+// Usado pelo botão "Sincronizar", pra saber o que já existe antes de tentar criar de novo.
+async function descSincronizarOfertas(chamar, ctx) {
+  const existentes = await descOfertasExistentes(chamar, ctx);
+  const agora = Math.floor(Date.now() / 1000);
+  const lista = existentes.lista
+    .map((f) => ({
+      flashSaleId: f.flash_sale_id, timeslotId: f.timeslot_id,
+      inicio: f.start_time ? descFormatarDataLocalBR(f.start_time) : null,
+      fim: f.end_time ? descFormatarDataLocalBR(f.end_time) : null,
+      status: f.status ?? (f.start_time <= agora && f.end_time > agora ? 'ongoing' : (f.start_time > agora ? 'upcoming' : 'ended'))
+    }))
+    .sort((a, b) => (a.timeslotId || 0) - (b.timeslotId || 0));
+  return { ok: true, confiavel: existentes.confiavel, total: lista.length, ofertas: lista };
+}
+
 // Cria uma oferta relâmpago em CADA horário livre que a Shopee liberou (até maxHorarios).
 // Horário que a loja já tem é pulado; se NENHUM produto entrar num horário, a oferta vazia é apagada;
 // depois de 2 horários seguidos sem sucesso, para (evita insistir num erro que se repete).
