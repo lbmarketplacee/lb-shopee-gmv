@@ -393,6 +393,22 @@ function ofrFatia(itens, indice, limite, excluir) {
   return fatia;
 }
 
+// Consulta as ofertas relâmpago que a loja JÁ TEM na Shopee agora (agendadas + em andamento), sem criar nada.
+// Usado pelo botão "Sincronizar", pra saber o que já existe antes de tentar criar de novo.
+async function descSincronizarOfertas(chamar, ctx) {
+  const existentes = await descOfertasExistentes(chamar, ctx);
+  const agora = Math.floor(Date.now() / 1000);
+  const lista = existentes.lista
+    .map((f) => ({
+      flashSaleId: f.flash_sale_id, timeslotId: f.timeslot_id,
+      inicio: f.start_time ? descFormatarDataLocalBR(f.start_time) : null,
+      fim: f.end_time ? descFormatarDataLocalBR(f.end_time) : null,
+      status: f.status ?? (f.start_time <= agora && f.end_time > agora ? 'ongoing' : (f.start_time > agora ? 'upcoming' : 'ended'))
+    }))
+    .sort((a, b) => (a.timeslotId || 0) - (b.timeslotId || 0));
+  return { ok: true, confiavel: existentes.confiavel, total: lista.length, ofertas: lista };
+}
+
 // Cria uma oferta relâmpago em CADA horário livre que a Shopee liberou (até maxHorarios).
 // Horário que a loja já tem é pulado; se NENHUM produto entrar num horário, a oferta vazia é apagada;
 // depois de 2 horários seguidos sem sucesso, para (evita insistir num erro que se repete).
@@ -677,6 +693,14 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, total_ofertas: r.totalOfertas, total_produtos: r.totalProdutos, flash_sale_id: r.flashSaleId,
         criadas: r.criadas, puladas: r.puladas, ja_existiam: r.jaExistiam, falhas: r.falhas, motivos: r.motivos,
         estoque_conhecido: r.estoqueConhecido, amostra_item_desconto: r.amostraItemDesconto, produtos_descartados_por_estoque: r.produtosDescartadosPorEstoque });
+    }
+
+    // 9) Sincronizar Ofertas Relâmpago — só CONSULTA o que a loja já tem na Shopee agora, não cria nada.
+    if (acao === 'sincronizar_ofertas') {
+      const { access_token, shop_id } = params;
+      const chamar = (path, q, metodo = 'GET', body = null) => chamarShopee(path, q, metodo, body, 'mkt');
+      const r = await descSincronizarOfertas(chamar, { accessToken: access_token, shopId: shop_id });
+      return res.status(200).json({ ok: true, confiavel: r.confiavel, total: r.total, ofertas: r.ofertas });
     }
 
     // 10) Listar os descontos da loja (app Marketing) — pra equipe escolher qual é o "desconto fixo"
