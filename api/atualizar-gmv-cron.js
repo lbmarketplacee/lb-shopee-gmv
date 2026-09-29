@@ -676,7 +676,6 @@ async function renovarCupomFixo(accessToken, shopId, db, clienteId, nomeCliente)
 
   return await criarCupomFixo(accessToken, shopId, db, clienteId, nomeCliente, maisRecente.end_time + DEZ_MINUTOS);
 }
-}
 
 // Garante que a loja tem oferta relâmpago em TODOS os horários que a Shopee liberou. Horário que a loja
 // já tem é pulado, então rodar todo dia não duplica nada. Produtos e preço vêm do desconto fixo (app Marketing).
