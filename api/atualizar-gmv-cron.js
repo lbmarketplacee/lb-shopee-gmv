@@ -676,6 +676,15 @@ async function garantirOfertasRelampago(accessTokenMkt, shopIdMkt, cliente){
 // MODO DIÁRIO DE OFERTAS (?modo=ofertas): passa por TODO cliente com Marketing conectado — não depende do app GMV —,
 // começando pelo verificado há mais tempo. Tem limite de tempo (a função da Vercel para em 60s): quem não der tempo
 // hoje fica no começo da fila de amanhã. Loja que a Shopee marcou como não elegível só é revisada de novo em 7 dias.
+// Grava no banco pra aparecer na aba Erros do sistema, mesmo sem ninguém com a tela aberta na hora.
+async function registrarErroOferta(db, clienteNome, acao, mensagem){
+  try {
+    await db.collection('shopeeErrosOferta').add({
+      cliente: clienteNome, acao, mensagem: String(mensagem).slice(0, 300), quando: new Date()
+    });
+  } catch (e) { console.error('[OFERTAS CRON] não salvou erro no painel:', e.message); }
+}
+
 async function rodarOfertasRelampago(db, res){
   const INICIO = Date.now();
   const ORCAMENTO_MS = 45000;
@@ -698,12 +707,17 @@ async function rodarOfertasRelampago(db, res){
       const r = await garantirOfertasRelampago(accessTokenMkt, cliente.shopeeMktShopId, cliente);
       atualizacao.ofertaRelampagoAutoUltimoResultado = String(r.motivo || '').slice(0, 220);
       if (r.criado) { atualizacao.ofertaRelampagoAutoUltimaCriacao = new Date(); ofertasCriadas += r.totalOfertas; }
+      else {
+        const acao = r.naoElegivel ? 'Loja não elegível' : (r.semHorario ? 'Sem horário liberado' : 'Não criou');
+        await registrarErroOferta(db, cliente.nome, acao, r.motivo || 'Sem detalhe.');
+      }
       if (r.naoElegivel) atualizacao.ofertaRelampagoNaoElegivelAte = Date.now() + SETE_DIAS_MS;
       else if (cliente.ofertaRelampagoNaoElegivelAte) atualizacao.ofertaRelampagoNaoElegivelAte = null;
       console.log(`[OFERTAS CRON] ${cliente.nome}: ${r.criado ? 'CRIOU' : 'não criou'} — ${r.motivo || ''}`);
       resultados.push({ cliente: cliente.nome, ...r });
     } catch (e) {
       atualizacao.ofertaRelampagoAutoUltimoResultado = `Erro: ${e.message}`.slice(0, 220);
+      await registrarErroOferta(db, cliente.nome, 'Erro', e.message);
       console.error(`[OFERTAS CRON] ERRO — ${cliente.nome}: ${e.message}`);
       resultados.push({ cliente: cliente.nome, erro: e.message });
     }
