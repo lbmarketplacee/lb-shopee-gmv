@@ -380,12 +380,16 @@ async function descOfertasExistentes(chamar, ctx) {
   return { lista, confiavel: algumaOk };
 }
 
-// Cada horário recebe um grupo diferente de produtos (roda pelo catálogo do desconto), sem repetir entre horários.
-function ofrFatia(itens, indice, limite) {
-  if (itens.length <= limite) return itens;
-  const ini = (indice * limite) % itens.length;
+// Cada horário recebe um grupo diferente de produtos (roda pelo catálogo do desconto), sem repetir entre horários
+// e PULANDO quem já foi recusado por estoque em algum horário anterior desta mesma execução — aprende na hora,
+// já que não dá pra saber o estoque real de antemão (API de produto não autorizada pro app Marketing/GMV).
+function ofrFatia(itens, indice, limite, excluir) {
+  const disponiveis = excluir && excluir.size ? itens.filter((it) => !excluir.has(it.item_id)) : itens;
+  if (!disponiveis.length) return [];
+  if (disponiveis.length <= limite) return disponiveis;
+  const ini = (indice * limite) % disponiveis.length;
   const fatia = [];
-  for (let k = 0; k < limite; k++) fatia.push(itens[(ini + k) % itens.length]);
+  for (let k = 0; k < limite; k++) fatia.push(disponiveis[(ini + k) % disponiveis.length]);
   return fatia;
 }
 
@@ -424,6 +428,7 @@ async function descCriarOfertasRelampago(chamar, ctx, opcoes = {}) {
   let semSucessoSeguidos = 0;
   const deslocamento = existentes.lista.length; // ofertas que a loja já tem empurram a rotação de produtos
   const listaFalhas = (r) => { const l = r?.response?.failed_items ?? r?.response?.failed_list ?? []; return Array.isArray(l) ? l : []; };
+  const semEstoqueNestaExecucao = new Set(); // aprendido durante a execução: não tenta de novo nos próximos horários
 
   for (const slot of livres.slice(0, maxHorarios)) {
     const inicioTxt = descFormatarDataLocalBR(slot.start_time);
@@ -437,7 +442,8 @@ async function descCriarOfertasRelampago(chamar, ctx, opcoes = {}) {
       continue;
     }
 
-    const fatia = ofrFatia(origem.itens, deslocamento + criadas.length + puladas.length, limite);
+    const fatia = ofrFatia(origem.itens, deslocamento + criadas.length + puladas.length, limite, semEstoqueNestaExecucao);
+    if (!fatia.length) { puladas.push({ timeslotId: slot.timeslot_id, inicio: inicioTxt, motivo: 'Todos os produtos do desconto já foram testados e recusados por estoque nesta execução.' }); if (++semSucessoSeguidos >= 2) break; continue; }
     const adicionar = (lista, q, f) => chamar('/api/v2/shop_flash_sale/add_shop_flash_sale_items', base, 'POST',
       { flash_sale_id: flashSaleId, items: ofrMontarItens(lista, q, f) });
     const aceitosDe = (r, chaves) => (r?.error ? 0 : ofrContarAceitos(fatia, chaves));
@@ -452,7 +458,7 @@ async function descCriarOfertasRelampago(chamar, ctx, opcoes = {}) {
     }
 
     const falhasSlot = (adicao?.error ? [] : listaFalhas(adicao)).filter((f) => chaves.has(ofrChave(f)));
-    falhasSlot.forEach((f) => falhasItens.push(f));
+    falhasSlot.forEach((f) => { falhasItens.push(f); if (ofrEhEstoque(f)) semEstoqueNestaExecucao.add(f.item_id); });
     const adicionados = aceitosDe(adicao, chaves);
 
     if (adicionados === 0) {
@@ -470,7 +476,7 @@ async function descCriarOfertasRelampago(chamar, ctx, opcoes = {}) {
   const totalProdutos = criadas.reduce((s, o) => s + o.totalProdutos, 0);
   const resumo = { criadas, puladas, totalOfertas: criadas.length, totalProdutos, horariosEncontrados: horarios.slots.length,
     jaExistiam: horarios.slots.length - livres.length, formatoUsado: formato, falhas: falhasItens.slice(0, 5), motivos: ofrResumirMotivos(falhasItens),
-    estoqueConhecido: origem.estoqueConhecido, amostraItemDesconto: origem.amostra,
+    estoqueConhecido: origem.estoqueConhecido, amostraItemDesconto: origem.amostra, produtosDescartadosPorEstoque: semEstoqueNestaExecucao.size,
     flashSaleId: criadas[0]?.flashSaleId, timeslotId: criadas[0]?.timeslotId };
   if (!criadas.length) {
     return { ok: false, ...resumo, erro: `Nenhuma oferta foi criada. ${puladas.slice(0, 2).map((p) => `${p.inicio}: ${p.motivo}`).join(' | ')}` };
@@ -670,7 +676,7 @@ export default async function handler(req, res) {
       if (!r.ok) return res.status(200).json({ ok: false, erro: r.erro, detalhe: r });
       return res.status(200).json({ ok: true, total_ofertas: r.totalOfertas, total_produtos: r.totalProdutos, flash_sale_id: r.flashSaleId,
         criadas: r.criadas, puladas: r.puladas, ja_existiam: r.jaExistiam, falhas: r.falhas, motivos: r.motivos,
-        estoque_conhecido: r.estoqueConhecido, amostra_item_desconto: r.amostraItemDesconto });
+        estoque_conhecido: r.estoqueConhecido, amostra_item_desconto: r.amostraItemDesconto, produtos_descartados_por_estoque: r.produtosDescartadosPorEstoque });
     }
 
     // 10) Listar os descontos da loja (app Marketing) — pra equipe escolher qual é o "desconto fixo"
