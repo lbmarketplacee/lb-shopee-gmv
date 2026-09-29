@@ -516,6 +516,23 @@ export default async function handler(req, res) {
     const appEscolhido = (params.app === 'mkt' || params.app === 'ads') ? params.app : 'gmv';
     const { partnerId, partnerKey, ambiente } = getConfig(appEscolhido);
 
+    // -1) Rodar o robô diário de Oferta Relâmpago agora mesmo (botão "Rodar robô agora" do sistema).
+    //     Chama o cron internamente, servidor-a-servidor — o CRON_SECRET nunca chega no navegador.
+    if (acao === 'rodar_robo_ofertas') {
+      const secret = process.env.CRON_SECRET;
+      if (!secret) return res.status(200).json({ ok: false, erro: 'CRON_SECRET não configurado neste projeto.' });
+      const host = req.headers?.['x-forwarded-host'] || req.headers?.host || process.env.VERCEL_URL;
+      try {
+        const r = await fetch(`https://${host}/api/atualizar-gmv-cron?modo=ofertas`, {
+          headers: { Authorization: `Bearer ${secret}` }
+        });
+        const data = await r.json();
+        return res.status(200).json(data);
+      } catch (e) {
+        return res.status(200).json({ ok: false, erro: `Não foi possível chamar o robô: ${e.message}` });
+      }
+    }
+
     // 0) Diagnóstico — nunca expõe a chave, só confirma tamanho/formato
     if (acao === 'diagnostico') {
       const gmv = getConfig('gmv');
