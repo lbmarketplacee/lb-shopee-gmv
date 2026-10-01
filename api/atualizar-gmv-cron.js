@@ -22,7 +22,7 @@ function gerarAssinatura(path, timestamp, partnerId, partnerKey, accessToken='',
 }
 
 function getConfig(app = 'gmv'){
-  const prefixo = app === 'mkt' ? 'SHOPEE_MKT_' : 'SHOPEE_';
+  const prefixo = app === 'mkt' ? 'SHOPEE_MKT_' : app === 'produto' ? 'SHOPEE_PRODUTO_' : 'SHOPEE_';
   return {
     partnerId: limpar(process.env[`${prefixo}PARTNER_ID`]),
     partnerKey: limpar(process.env[`${prefixo}PARTNER_KEY`]),
@@ -97,6 +97,31 @@ async function garantirTokenValidoMkt(db, cliente){
     shopeeMktAccessToken: resultado.access_token,
     shopeeMktRefreshToken: resultado.refresh_token,
     shopeeMktTokenExpiraEm: novaExpiraEm
+  });
+  return resultado.access_token;
+}
+
+// Igual garantirTokenValidoMkt, mas pro app Produto (opcional — usado só pra filtrar estoque na oferta relâmpago).
+// Devolve null se o cliente nunca conectou esse app, em vez de dar erro (a oferta segue sem o filtro nesse caso).
+async function garantirTokenValidoProduto(db, cliente){
+  if (!cliente.shopeeProdutoShopId || !cliente.shopeeProdutoRefreshToken) return null;
+  const agora = Date.now();
+  const expiraEmRaw = cliente.shopeeProdutoTokenExpiraEm;
+  const expiraEm = expiraEmRaw?.toMillis ? expiraEmRaw.toMillis() : expiraEmRaw;
+  if (expiraEm && agora < expiraEm - 5 * 60 * 1000) {
+    return cliente.shopeeProdutoAccessToken;
+  }
+  const resultado = await chamarShopee('/api/v2/auth/access_token/get', {}, 'POST', {
+    refresh_token: cliente.shopeeProdutoRefreshToken,
+    shop_id: Number(cliente.shopeeProdutoShopId),
+    partner_id: Number(getConfig('produto').partnerId)
+  }, 'produto');
+  if (!resultado?.access_token) throw new Error('Não foi possível renovar token Produto: ' + JSON.stringify(resultado));
+  const novaExpiraEm = Date.now() + (resultado.expire_in * 1000);
+  await db.collection('clientes').doc(cliente.id).update({
+    shopeeProdutoAccessToken: resultado.access_token,
+    shopeeProdutoRefreshToken: resultado.refresh_token,
+    shopeeProdutoTokenExpiraEm: novaExpiraEm
   });
   return resultado.access_token;
 }
@@ -271,9 +296,37 @@ async function descDuplicar(chamar, ctx, discountId, opcoes = {}) {
 // preço que a oferta calcula o percentual.
 const OFR_MARGEM_INICIO = 120; // a Shopee recusa início no passado: a busca de horário começa ~2 min à frente
 const OFR_ERRO_ESTOQUE = 1400101726; // "This item cannot be added as there is insufficient stock."
+const OFR_MIN_PROMO_STOCK = 20; // confirmado via v2.shop_flash_sale.get_item_criteria (categoria "All")
+
+// Busca o ESTOQUE REAL (total_available_stock, não o seller_stock — já pode estar reservado por outra
+// promoção ativa) via o app Produto. Produto com variação usa get_model_list (1 item por chamada, é
+// como a Shopee expõe); produto sem variação usa get_item_base_info (até 50 item_id por chamada).
+// Devolve um Map "item_id:model_id" -> estoque disponível (model_id "0" pra produto sem variação).
+async function ofrBuscarEstoqueReal(chamarProduto, itensComModelo, itensSemModelo) {
+  const estoque = new Map();
+  for (const it of itensComModelo) {
+    try {
+      const r = await chamarProduto('/api/v2/product/get_model_list', { item_id: it.item_id }, 'GET', null);
+      (r?.response?.model || []).forEach((m) => {
+        const v = m?.stock_info_v2?.summary_info?.total_available_stock;
+        estoque.set(`${it.item_id}:${m.model_id}`, typeof v === 'number' ? v : 0);
+      });
+    } catch (e) { /* item some da seleção se não conseguir ler o estoque dele — mais seguro que assumir OK */ }
+  }
+  for (let i = 0; i < itensSemModelo.length; i += 50) {
+    const lote = itensSemModelo.slice(i, i + 50);
+    try {
+      const r = await chamarProduto('/api/v2/product/get_item_base_info', { item_id_list: lote.map((x) => x.item_id).join(',') }, 'GET', null);
+      (r?.response?.item_list || []).forEach((item) => {
+        const v = item?.stock_info_v2?.summary_info?.total_available_stock;
+        estoque.set(`${item.item_id}:0`, typeof v === 'number' ? v : 0);
+      });
+    } catch (e) { /* idem */ }
+  }
+  return estoque;
+}
 
 function ofrArredondar(v) { return Math.round(v * 100) / 100; }
-function ofrNumero(v) { return typeof v === 'number' && Number.isFinite(v) ? v : null; }
 
 // A Shopee recusa a chamada quando a LOJA não atende às regras da Oferta Relâmpago da Loja (não é problema de permissão do app).
 function ofrErroAmigavel(resp, contexto) {
@@ -314,7 +367,7 @@ function ofrResumirMotivos(falhas) {
 
 // Lê o(s) desconto(s) em andamento e devolve os produtos com preço promocional já calculado.
 // Usa o estoque real que o desconto informa (quando informa) pra nunca pedir mais unidades do que existem.
-async function descItensParaOfertaRelampago(chamar, ctx, { discountId, percentual, qtdPorProduto, limite }) {
+async function descItensParaOfertaRelampago(chamar, ctx, { discountId, percentual, qtdPorProduto, limite, chamarProduto }) {
   const agora = Math.floor(Date.now() / 1000);
   let ids = [];
   if (discountId) {
@@ -329,10 +382,11 @@ async function descItensParaOfertaRelampago(chamar, ctx, { discountId, percentua
   }
 
   const fator = 1 - percentual / 100;
-  const itens = [];
+  // Preço vem do desconto; ESTOQUE vem do app Produto quando conectado (os campos do desconto não trazem
+  // estoque de verdade — já confirmamos isso ao vivo). Monta candidatos primeiro, filtra por estoque depois.
+  const candidatos = [];
   const vistos = new Set();
   const erros = [];
-  let estoqueConhecido = false;
   let amostra = null;
   for (const id of ids) {
     const lido = await descLerDesconto(chamar, ctx, id);
@@ -343,33 +397,52 @@ async function descItensParaOfertaRelampago(chamar, ctx, { discountId, percentua
     }
     if (!amostra && lido.itens[0]) amostra = JSON.stringify(lido.itens[0]).slice(0, 700);
     for (const it of lido.itens) {
-      if (itens.length >= limite) break;
       if (vistos.has(it.item_id)) continue;
       vistos.add(it.item_id);
       const modelos = (it.model_list || [])
-        .map((m) => ({ model_id: m.model_id, preco: m.model_promotion_price ?? m.discount_price,
-                       estoque: ofrNumero(m.model_normal_stock) ?? ofrNumero(m.normal_stock) ?? ofrNumero(m.model_stock) }))
+        .map((m) => ({ model_id: m.model_id, preco: m.model_promotion_price ?? m.discount_price }))
         .filter((m) => m.preco > 0);
       if (modelos.length) {
-        modelos.forEach((m) => { if (m.estoque !== null) estoqueConhecido = true; });
-        const usaveis = modelos.filter((m) => m.estoque === null || m.estoque >= 1); // variação sem estoque não entra
-        if (!usaveis.length) continue;
-        itens.push({ item_id: it.item_id, modelos: usaveis.map((m) => ({ model_id: m.model_id,
-          input_promo_price: ofrArredondar(m.preco * fator), stock: m.estoque === null ? qtdPorProduto : Math.min(qtdPorProduto, m.estoque) })) });
+        candidatos.push({ item_id: it.item_id, modelos });
       } else if (!(it.model_list || []).length && it.item_promotion_price > 0) {
-        const estoque = ofrNumero(it.normal_stock) ?? ofrNumero(it.item_normal_stock);
-        if (estoque !== null) estoqueConhecido = true;
-        if (estoque !== null && estoque < 1) continue;
-        itens.push({ item_id: it.item_id, simples: { input_promo_price: ofrArredondar(it.item_promotion_price * fator),
-          stock: estoque === null ? qtdPorProduto : Math.min(qtdPorProduto, estoque) } });
+        candidatos.push({ item_id: it.item_id, simples: { preco: it.item_promotion_price } });
       }
     }
+  }
+  if (!candidatos.length) {
+    return { ok: false, erro: erros.length ? `Não consegui ler o desconto: ${erros[0]}` : 'Não consegui ler o preço promocional de nenhum produto do desconto.' };
+  }
+
+  // Sem app Produto conectado: segue sem filtrar por estoque (comportamento antigo — tenta e deixa a
+  // Shopee recusar na hora de adicionar). Com o app conectado, filtra ANTES de tentar.
+  let estoquePorChave = null;
+  if (chamarProduto) {
+    const comModelo = candidatos.filter((c) => c.modelos);
+    const semModelo = candidatos.filter((c) => c.simples);
+    estoquePorChave = await ofrBuscarEstoqueReal(chamarProduto, comModelo, semModelo);
+  }
+
+  const itens = [];
+  for (const c of candidatos) {
     if (itens.length >= limite) break;
+    if (c.modelos) {
+      const usaveis = c.modelos
+        .map((m) => ({ ...m, estoque: estoquePorChave ? (estoquePorChave.get(`${c.item_id}:${m.model_id}`) ?? 0) : null }))
+        .filter((m) => m.estoque === null || m.estoque >= OFR_MIN_PROMO_STOCK);
+      if (!usaveis.length) continue;
+      itens.push({ item_id: c.item_id, modelos: usaveis.map((m) => ({ model_id: m.model_id,
+        input_promo_price: ofrArredondar(m.preco * fator), stock: m.estoque === null ? qtdPorProduto : Math.min(qtdPorProduto, m.estoque) })) });
+    } else {
+      const estoque = estoquePorChave ? (estoquePorChave.get(`${c.item_id}:0`) ?? 0) : null;
+      if (estoque !== null && estoque < OFR_MIN_PROMO_STOCK) continue;
+      itens.push({ item_id: c.item_id, simples: { input_promo_price: ofrArredondar(c.simples.preco * fator),
+        stock: estoque === null ? qtdPorProduto : Math.min(qtdPorProduto, estoque) } });
+    }
   }
   if (!itens.length) {
-    return { ok: false, erro: erros.length ? `Não consegui ler o desconto: ${erros[0]}` : 'Não consegui ler o preço promocional de nenhum produto do desconto (ou todos estão sem estoque).' };
+    return { ok: false, erro: estoquePorChave ? 'Nenhum produto do desconto tem estoque suficiente pra oferta relâmpago (mínimo de 20 unidades, exigido pela Shopee).' : 'Não consegui ler o preço promocional de nenhum produto do desconto.' };
   }
-  return { ok: true, itens, estoqueConhecido, amostra };
+  return { ok: true, itens, estoqueConhecido: !!estoquePorChave, amostra };
 }
 
 // Produto simples: tenta o formato "item_input_promo_price/item_stock"; se a Shopee recusar, o formato "models" (model_id 0).
@@ -451,7 +524,7 @@ async function descCriarOfertasRelampago(chamar, ctx, opcoes = {}) {
   const maxHorarios = Math.max(1, Math.min(opcoes.maxHorarios ?? 14, 30));
   const base = { access_token: ctx.accessToken, shop_id: ctx.shopId };
 
-  const origem = await descItensParaOfertaRelampago(chamar, ctx, { discountId: opcoes.discountId, percentual, qtdPorProduto: qtd, limite: Infinity });
+  const origem = await descItensParaOfertaRelampago(chamar, ctx, { discountId: opcoes.discountId, percentual, qtdPorProduto: qtd, limite: Infinity, chamarProduto: opcoes.chamarProduto });
   if (!origem.ok) return { ok: false, erro: origem.erro };
 
   const desde = Math.floor(Date.now() / 1000) + OFR_MARGEM_INICIO;
@@ -679,13 +752,23 @@ async function renovarCupomFixo(accessToken, shopId, db, clienteId, nomeCliente)
 
 // Garante que a loja tem oferta relâmpago em TODOS os horários que a Shopee liberou. Horário que a loja
 // já tem é pulado, então rodar todo dia não duplica nada. Produtos e preço vêm do desconto fixo (app Marketing).
-async function garantirOfertasRelampago(accessTokenMkt, shopIdMkt, cliente){
+async function garantirOfertasRelampago(db, accessTokenMkt, shopIdMkt, cliente){
   const chamar = (path, params, metodo = 'GET', body = null) => chamarShopee(path, params, metodo, body, 'mkt');
+  // App Produto é opcional — se o cliente ainda não conectou, segue sem o filtro de estoque. Erro ao
+  // renovar o token do Produto não pode derrubar a oferta inteira, por isso o try/catch aqui.
+  let chamarProduto;
+  try {
+    const tokenProduto = await garantirTokenValidoProduto(db, cliente);
+    if (tokenProduto) {
+      chamarProduto = (path, q, metodo = 'GET', body = null) =>
+        chamarShopee(path, { ...q, access_token: tokenProduto, shop_id: cliente.shopeeProdutoShopId }, metodo, body, 'produto');
+    }
+  } catch (e) { console.error('[OFERTAS CRON] token Produto falhou, seguindo sem filtro de estoque:', e.message); }
   // maxHorarios baixo de propósito aqui: o robô roda TODO dia e nunca recria horário já preenchido,
   // então o resto vai sendo completado nos próximos dias sem risco de estourar o tempo da função (60s,
   // com vários clientes na mesma execução). O botão manual (shopee.js) não tem esse limite.
   const r = await descCriarOfertasRelampago(chamar, { accessToken: accessTokenMkt, shopId: shopIdMkt }, {
-    discountId: cliente.shopeeDescontoFixoId || undefined, percentual: 5, qtdPorProduto: 5, limite: 20, maxHorarios: 4
+    discountId: cliente.shopeeDescontoFixoId || undefined, percentual: 5, qtdPorProduto: 5, limite: 20, maxHorarios: 4, chamarProduto
   });
   if (!r.ok) return { criado: false, motivo: r.erro, semHorario: !!r.semHorario, jaTemTodas: !!r.jaTemTodas, naoElegivel: !!r.naoElegivel };
   return { criado: true, totalOfertas: r.totalOfertas, totalProdutos: r.totalProdutos, puladas: r.puladas.length, motivo: `${r.totalOfertas} oferta(s) criada(s) (${r.totalProdutos} produto(s))${r.puladas.length ? `, ${r.puladas.length} horário(s) pulado(s)` : ''}${r.motivos ? ` | recusas: ${r.motivos}` : ''}` };
@@ -722,7 +805,7 @@ async function rodarOfertasRelampago(db, res){
     const atualizacao = { ofertaRelampagoUltimaVerificacao: Date.now() };
     try {
       const accessTokenMkt = await garantirTokenValidoMkt(db, cliente);
-      const r = await garantirOfertasRelampago(accessTokenMkt, cliente.shopeeMktShopId, cliente);
+      const r = await garantirOfertasRelampago(db, accessTokenMkt, cliente.shopeeMktShopId, cliente);
       atualizacao.ofertaRelampagoAutoUltimoResultado = String(r.motivo || '').slice(0, 220);
       if (r.criado) { atualizacao.ofertaRelampagoAutoUltimaCriacao = new Date(); ofertasCriadas += r.totalOfertas; }
       else {
