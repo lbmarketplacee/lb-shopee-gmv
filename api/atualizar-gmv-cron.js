@@ -126,6 +126,72 @@ async function garantirTokenValidoProduto(db, cliente){
   return resultado.access_token;
 }
 
+// Igual garantirTokenValidoProduto, mas pro app ERP. Devolve null se o cliente não migrou pro ERP ainda.
+async function garantirTokenValidoErp(db, cliente){
+  if (!cliente.shopeeErpShopId || !cliente.shopeeErpRefreshToken) return null;
+  const agora = Date.now();
+  const expiraEmRaw = cliente.shopeeErpTokenExpiraEm;
+  const expiraEm = expiraEmRaw?.toMillis ? expiraEmRaw.toMillis() : expiraEmRaw;
+  if (expiraEm && agora < expiraEm - 5 * 60 * 1000) {
+    return cliente.shopeeErpAccessToken;
+  }
+  const resultado = await chamarShopee('/api/v2/auth/access_token/get', {}, 'POST', {
+    refresh_token: cliente.shopeeErpRefreshToken,
+    shop_id: Number(cliente.shopeeErpShopId),
+    partner_id: Number(getConfig('erp').partnerId)
+  }, 'erp');
+  if (!resultado?.access_token) throw new Error('Não foi possível renovar token ERP: ' + JSON.stringify(resultado));
+  const novaExpiraEm = Date.now() + (resultado.expire_in * 1000);
+  await db.collection('clientes').doc(cliente.id).update({
+    shopeeErpAccessToken: resultado.access_token,
+    shopeeErpRefreshToken: resultado.refresh_token,
+    shopeeErpTokenExpiraEm: novaExpiraEm
+  });
+  return resultado.access_token;
+}
+
+// MODO FINANCEIRO (?modo=financeiro): roda 1x por dia, só em clientes já migrados pro ERP (é a única
+// conexão com permissão de Financeiro). Lê o extrato, compara a semana atual com a anterior, e registra
+// um alerta (mesma coleção da aba Erros) quando a receita cair 40% ou mais — aviso cedo, não é cobrança.
+async function rodarAlertasFinanceiros(db, res){
+  const INICIO = Date.now();
+  const ORCAMENTO_MS = 30000;
+  const snapshot = await db.collection('clientes').where('shopeeErpShopId', '!=', null).get();
+  const clientes = snapshot.docs.map(d => ({ id: d.id, ...d.data() })).filter(c => c.shopeeErpShopId && c.ativo !== false);
+  let verificados = 0, comQuedaForte = 0, aguardando = 0;
+  const resultados = [];
+  for (const cliente of clientes) {
+    if (Date.now() - INICIO > ORCAMENTO_MS) { aguardando++; continue; }
+    try {
+      const token = await garantirTokenValidoErp(db, cliente);
+      const chamarErp = (path, q, metodo = 'GET', body = null) => chamarShopee(path, { ...q, access_token: token, shop_id: cliente.shopeeErpShopId }, metodo, body, 'erp');
+      const extrato = await finBuscarExtrato(chamarErp, {}, { limite: 200 });
+      if (!extrato.ok) { resultados.push({ cliente: cliente.nome, erro: extrato.erro }); verificados++; continue; }
+      const resumo = finResumoSaude(extrato.transacoes);
+      await db.collection('clientes').doc(cliente.id).update({
+        financeiroUltimaVerificacao: Date.now(),
+        financeiroSaldoAtual: resumo.saldoAtual,
+        financeiroVariacaoSemanal: resumo.variacaoPercentual
+      });
+      if (resumo.quedaForte) {
+        comQuedaForte++;
+        await db.collection('shopeeErrosOferta').add({
+          cliente: cliente.nome, acao: 'Queda de receita (Financeiro)',
+          mensagem: `Receita da semana caiu ${resumo.variacaoPercentual}% em relação à semana anterior (de ${resumo.entradasSemanaAnterior} pra ${resumo.entradas7d}).`,
+          quando: new Date()
+        });
+      }
+      resultados.push({ cliente: cliente.nome, saldoAtual: resumo.saldoAtual, variacaoPercentual: resumo.variacaoPercentual, quedaForte: resumo.quedaForte });
+    } catch (e) {
+      console.error(`[FINANCEIRO CRON] ERRO — ${cliente.nome}: ${e.message}`);
+      resultados.push({ cliente: cliente.nome, erro: e.message });
+    }
+    verificados++;
+  }
+  console.log(`[FINANCEIRO CRON] verificados: ${verificados} | quedas fortes: ${comQuedaForte} | ficaram pra amanhã: ${aguardando}`);
+  return res.status(200).json({ ok: true, modo: 'financeiro', totalClientes: clientes.length, verificados, comQuedaForte, aguardando, resultados });
+}
+
 const DEZ_MINUTOS = 10 * 60;
 const JANELA_ANTECEDENCIA = 8 * 24 * 60 * 60; // olha pra frente até 8 dias (cron roda 1x por semana)
 
@@ -953,6 +1019,72 @@ async function liberarLock(db){
   await db.collection('configuracoes').doc('cronGmvLock').set({ emExecucao: false, iniciadoEm: new Date() });
 }
 
+// ===================== FINANCEIRO — "Caixa da Loja" (API v2.payment, só no app ERP) =====================
+// Campos confirmados AO VIVO em 02/10/2026 (AQUARIOS, pedido real): transaction_id, status, wallet_type,
+// transaction_type, amount, current_balance, create_time (unix), order_sn, transaction_fee, description,
+// buyer_name, transaction_tab_type, money_flow ('MONEY_IN'/'MONEY_OUT'), more (paginação).
+
+// Busca o extrato completo (pagina até acabar ou até o limite). Mais recente primeiro (ordem nativa da Shopee).
+async function finBuscarExtrato(chamarErp, ctx, opcoes = {}) {
+  const limite = opcoes.limite ?? 200;
+  const transacoes = [];
+  let pagina = 1;
+  for (let i = 0; i < 20; i++) { // trava de segurança: no máx. 20 páginas por chamada
+    const r = await chamarErp('/api/v2/payment/get_wallet_transaction_list',
+      { page_no: pagina, page_size: Math.min(100, limite - transacoes.length) }, 'GET', null);
+    if (r?.error) return { ok: false, erro: `${r.error}: ${r.message || ''}`.trim() };
+    const lote = r?.response?.transaction_list || [];
+    transacoes.push(...lote);
+    if (!r?.response?.more || transacoes.length >= limite || !lote.length) break;
+    pagina++;
+  }
+  return { ok: true, transacoes, saldoAtual: transacoes[0]?.current_balance ?? null };
+}
+
+// Resumo de saúde financeira: saldo atual, entradas/saídas nos últimos N dias, e a variação
+// comparando a semana atual com a anterior (pra detectar queda de saldo cedo).
+function finResumoSaude(transacoes, agoraUnix = Math.floor(Date.now() / 1000)) {
+  const DIA = 86400;
+  const somaPeriodo = (ini, fim, campo) => transacoes
+    .filter((t) => t.create_time >= ini && t.create_time < fim)
+    .reduce((s, t) => s + (campo === 'in' ? (t.money_flow === 'MONEY_IN' ? t.amount : 0) : (t.money_flow === 'MONEY_OUT' ? t.amount : 0)), 0);
+
+  const entradas7d = somaPeriodo(agoraUnix - 7 * DIA, agoraUnix, 'in');
+  const saidas7d = somaPeriodo(agoraUnix - 7 * DIA, agoraUnix, 'out');
+  const entradasSemanaAnterior = somaPeriodo(agoraUnix - 14 * DIA, agoraUnix - 7 * DIA, 'in');
+
+  let variacaoPercentual = null;
+  if (entradasSemanaAnterior > 0) {
+    variacaoPercentual = Math.round(((entradas7d - entradasSemanaAnterior) / entradasSemanaAnterior) * 1000) / 10;
+  }
+
+  return {
+    saldoAtual: transacoes[0]?.current_balance ?? null,
+    entradas7d: Math.round(entradas7d * 100) / 100,
+    saidas7d: Math.round(saidas7d * 100) / 100,
+    entradasSemanaAnterior: Math.round(entradasSemanaAnterior * 100) / 100,
+    variacaoPercentual,
+    quedaForte: variacaoPercentual !== null && variacaoPercentual <= -40, // queda de 40%+ na receita semanal
+    totalTransacoes: transacoes.length
+  };
+}
+
+// Formata uma transação pra exibir na tela (data em pt-BR, tipo em português).
+const FIN_TIPO_LABEL = { MONEY_IN: 'Entrada', MONEY_OUT: 'Saída' };
+function finFormatarTransacao(t) {
+  return {
+    id: t.transaction_id,
+    data: new Date(t.create_time * 1000).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
+    tipo: FIN_TIPO_LABEL[t.money_flow] || t.money_flow,
+    valor: t.amount,
+    saldoApos: t.current_balance,
+    pedido: t.order_sn || null,
+    descricao: t.description || t.transaction_type,
+    status: t.status
+  };
+}
+// =================== FIM — FINANCEIRO ===================
+
 export default async function handler(req, res) {
   // Proteção: só aceita chamadas com o segredo do cron (evita qualquer um disparar isso manualmente pela internet)
   const auth = req.headers['authorization'];
@@ -966,6 +1098,12 @@ export default async function handler(req, res) {
     CONTADOR_CHAMADAS_SHOPEE = 0;
     try { return await rodarOfertasRelampago(db, res); }
     catch (e) { console.error('[OFERTAS CRON] falha geral:', e); return res.status(500).json({ ok: false, erro: e.message }); }
+  }
+
+  if (req.query?.modo === 'financeiro') {
+    CONTADOR_CHAMADAS_SHOPEE = 0;
+    try { return await rodarAlertasFinanceiros(db, res); }
+    catch (e) { console.error('[FINANCEIRO CRON] falha geral:', e); return res.status(500).json({ ok: false, erro: e.message }); }
   }
 
   const lockOk = await adquirirLock(db);
