@@ -27,7 +27,7 @@ function gerarAssinatura(path, timestamp, partnerId, partnerKey, accessToken='',
 
 // app: 'gmv' (padrão) ou 'mkt' — escolhe qual par de credenciais usar
 function getConfig(app = 'gmv'){
-  const prefixo = app === 'mkt' ? 'SHOPEE_MKT_' : app === 'ads' ? 'SHOPEE_ADS_' : app === 'produto' ? 'SHOPEE_PRODUTO_' : 'SHOPEE_';
+  const prefixo = app === 'mkt' ? 'SHOPEE_MKT_' : app === 'ads' ? 'SHOPEE_ADS_' : app === 'produto' ? 'SHOPEE_PRODUTO_' : app === 'erp' ? 'SHOPEE_ERP_' : 'SHOPEE_';
   return {
     app,
     partnerId: limpar(process.env[`${prefixo}PARTNER_ID`]),
@@ -550,6 +550,237 @@ async function descCriarOfertasRelampago(chamar, ctx, opcoes = {}) {
 
 // =================== FIM — DESCONTO FIXO (lógica compartilhada) ===================
 
+// ===================== FINANCEIRO — "Caixa da Loja" (API v2.payment, só no app ERP) =====================
+// Campos confirmados AO VIVO em 02/10/2026 (AQUARIOS, pedido real): transaction_id, status, wallet_type,
+// transaction_type, amount, current_balance, create_time (unix), order_sn, transaction_fee, description,
+// buyer_name, transaction_tab_type, money_flow ('MONEY_IN'/'MONEY_OUT'), more (paginação).
+
+// Busca o extrato completo (pagina até acabar ou até o limite). Mais recente primeiro (ordem nativa da Shopee).
+async function finBuscarExtrato(chamarErp, ctx, opcoes = {}) {
+  const limite = opcoes.limite ?? 200;
+  const transacoes = [];
+  let pagina = 1;
+  for (let i = 0; i < 20; i++) { // trava de segurança: no máx. 20 páginas por chamada
+    const r = await chamarErp('/api/v2/payment/get_wallet_transaction_list',
+      { page_no: pagina, page_size: Math.min(100, limite - transacoes.length) }, 'GET', null);
+    if (r?.error) return { ok: false, erro: `${r.error}: ${r.message || ''}`.trim() };
+    const lote = r?.response?.transaction_list || [];
+    transacoes.push(...lote);
+    if (!r?.response?.more || transacoes.length >= limite || !lote.length) break;
+    pagina++;
+  }
+  return { ok: true, transacoes, saldoAtual: transacoes[0]?.current_balance ?? null };
+}
+
+// Resumo de saúde financeira: saldo atual, entradas/saídas nos últimos N dias, e a variação
+// comparando a semana atual com a anterior (pra detectar queda de saldo cedo).
+function finResumoSaude(transacoes, agoraUnix = Math.floor(Date.now() / 1000)) {
+  const DIA = 86400;
+  const somaPeriodo = (ini, fim, campo) => transacoes
+    .filter((t) => t.create_time >= ini && t.create_time < fim)
+    .reduce((s, t) => s + (campo === 'in' ? (t.money_flow === 'MONEY_IN' ? t.amount : 0) : (t.money_flow === 'MONEY_OUT' ? t.amount : 0)), 0);
+
+  const entradas7d = somaPeriodo(agoraUnix - 7 * DIA, agoraUnix, 'in');
+  const saidas7d = somaPeriodo(agoraUnix - 7 * DIA, agoraUnix, 'out');
+  const entradasSemanaAnterior = somaPeriodo(agoraUnix - 14 * DIA, agoraUnix - 7 * DIA, 'in');
+
+  let variacaoPercentual = null;
+  if (entradasSemanaAnterior > 0) {
+    variacaoPercentual = Math.round(((entradas7d - entradasSemanaAnterior) / entradasSemanaAnterior) * 1000) / 10;
+  }
+
+  return {
+    saldoAtual: transacoes[0]?.current_balance ?? null,
+    entradas7d: Math.round(entradas7d * 100) / 100,
+    saidas7d: Math.round(saidas7d * 100) / 100,
+    entradasSemanaAnterior: Math.round(entradasSemanaAnterior * 100) / 100,
+    variacaoPercentual,
+    quedaForte: variacaoPercentual !== null && variacaoPercentual <= -40, // queda de 40%+ na receita semanal
+    totalTransacoes: transacoes.length
+  };
+}
+
+// Formata uma transação pra exibir na tela (data em pt-BR, tipo em português).
+const FIN_TIPO_LABEL = { MONEY_IN: 'Entrada', MONEY_OUT: 'Saída' };
+function finFormatarTransacao(t) {
+  return {
+    id: t.transaction_id,
+    data: new Date(t.create_time * 1000).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
+    tipo: FIN_TIPO_LABEL[t.money_flow] || t.money_flow,
+    valor: t.amount,
+    saldoApos: t.current_balance,
+    pedido: t.order_sn || null,
+    descricao: t.description || t.transaction_type,
+    status: t.status
+  };
+}
+// =================== FIM — FINANCEIRO ===================
+
+// ===================== LOGÍSTICA — "Central de Envios" (API v2.logistics, só no app ERP) =====================
+// Campos confirmados AO VIVO em 02/10/2026 (AQUARIOS, pedido real 260921J62FHT1C):
+// response.logistics_status (status geral do pedido), response.tracking_info[] com
+// {update_time (unix), description (texto já em pt-BR, vem pronto da Shopee), logistics_status, return_code}.
+
+const LOG_STATUS_LABEL = {
+  LOGISTICS_DELIVERY_DONE: 'Entregue',
+  LOGISTICS_REQUEST_CREATED: 'Etiqueta gerada',
+  LOGISTICS_PICKUP_DONE: 'Coletado',
+  LOGISTICS_DELIVERY_FAILED: 'Falha na entrega',
+  LOGISTICS_PICKUP_FAILED: 'Falha na coleta'
+};
+
+// Busca o rastreio completo de um pedido, já formatado (mais recente primeiro — é a ordem nativa da Shopee).
+async function logBuscarRastreio(chamarErp, ctx, orderSn) {
+  const r = await chamarErp('/api/v2/logistics/get_tracking_info', { order_sn: orderSn }, 'GET', null);
+  if (r?.error) return { ok: false, erro: `${r.error}: ${r.message || ''}`.trim() };
+  const resp = r?.response || {};
+  const eventos = (resp.tracking_info || []).map((e) => ({
+    quando: new Date(e.update_time * 1000).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }),
+    descricao: e.description,
+    status: e.logistics_status
+  }));
+  return {
+    ok: true,
+    orderSn,
+    statusGeral: resp.logistics_status,
+    statusLabel: LOG_STATUS_LABEL[resp.logistics_status] || resp.logistics_status,
+    entregue: resp.logistics_status === 'LOGISTICS_DELIVERY_DONE',
+    ultimaAtualizacao: eventos[0] || null,
+    eventos
+  };
+}
+
+// Busca rastreio de VÁRIOS pedidos de uma vez (sequencial — a API não tem endpoint em lote pra isso).
+// Devolve um resumo por pedido, sem travar se um falhar (ex: pedido cancelado antes de ter rastreio).
+async function logBuscarRastreioEmLote(chamarErp, ctx, orderSns, limite = 20) {
+  const resultados = [];
+  for (const sn of orderSns.slice(0, limite)) {
+    try {
+      const r = await logBuscarRastreio(chamarErp, ctx, sn);
+      resultados.push(r.ok ? { orderSn: sn, ok: true, statusLabel: r.statusLabel, entregue: r.entregue, ultimaAtualizacao: r.ultimaAtualizacao } : { orderSn: sn, ok: false, erro: r.erro });
+    } catch (e) {
+      resultados.push({ orderSn: sn, ok: false, erro: e.message });
+    }
+  }
+  return resultados;
+}
+// =================== FIM — LOGÍSTICA ===================
+
+// ===================== PRODUTO — "Gestão de Catálogo" (API v2.product, app ERP ou Produto) =====================
+// update_price/update_stock/unlist_item são endpoints padrão e estáveis da Shopee (v2), ao contrário do
+// shop_flash_sale/discount que já nos pegou de surpresa — mesmo assim, toda ação de PREÇO sempre passa
+// por uma simulação primeiro (preview), nunca aplica direto, pra pegar qualquer diferença de formato cedo.
+
+function prodArredondar(v) { return Math.round(v * 100) / 100; }
+
+// Lê o preço e estoque atuais de um produto (com ou sem variação), pra montar a simulação.
+async function prodLerProduto(chamarErp, ctx, itemId) {
+  const base = await chamarErp('/api/v2/product/get_item_base_info', { item_id_list: String(itemId) }, 'GET', null);
+  if (base?.error) return { ok: false, erro: `${base.error}: ${base.message || ''}`.trim() };
+  const item = base?.response?.item_list?.[0];
+  if (!item) return { ok: false, erro: 'Produto não encontrado.' };
+
+  if (!item.has_model) {
+    return {
+      ok: true, itemId, temVariacao: false,
+      precoAtual: item.price_info?.[0]?.current_price ?? null,
+      estoqueAtual: item.stock_info_v2?.summary_info?.total_available_stock ?? null
+    };
+  }
+  const modelos = await chamarErp('/api/v2/product/get_model_list', { item_id: itemId }, 'GET', null);
+  if (modelos?.error) return { ok: false, erro: `${modelos.error}: ${modelos.message || ''}`.trim() };
+  return {
+    ok: true, itemId, temVariacao: true,
+    modelos: (modelos?.response?.model || []).map((m) => ({
+      modelId: m.model_id, nome: m.model_name,
+      precoAtual: m.price_info?.[0]?.current_price ?? null,
+      estoqueAtual: m.stock_info_v2?.summary_info?.total_available_stock ?? null
+    }))
+  };
+}
+
+// Monta a SIMULAÇÃO do reajuste (não aplica nada ainda) — pra mostrar na tela antes de confirmar.
+async function prodSimularReajustePreco(chamarErp, ctx, itemIds, percentual) {
+  const fator = 1 + percentual / 100;
+  const itens = [];
+  const erros = [];
+  for (const itemId of itemIds) {
+    const lido = await prodLerProduto(chamarErp, ctx, itemId);
+    if (!lido.ok) { erros.push({ itemId, erro: lido.erro }); continue; }
+    if (lido.temVariacao) {
+      itens.push({
+        itemId, temVariacao: true,
+        modelos: lido.modelos.filter((m) => m.precoAtual > 0).map((m) => ({
+          modelId: m.modelId, nome: m.nome, precoAtual: m.precoAtual, precoNovo: prodArredondar(m.precoAtual * fator)
+        }))
+      });
+    } else if (lido.precoAtual > 0) {
+      itens.push({ itemId, temVariacao: false, precoAtual: lido.precoAtual, precoNovo: prodArredondar(lido.precoAtual * fator) });
+    } else {
+      erros.push({ itemId, erro: 'Sem preço legível pra simular.' });
+    }
+  }
+  return { ok: true, percentual, totalProdutos: itens.length, totalComErro: erros.length, itens, erros };
+}
+
+// Aplica de verdade o reajuste já simulado (recebe o resultado de prodSimularReajustePreco).
+// Produto por produto — um falhar não trava os outros.
+async function prodAplicarReajustePreco(chamarErp, ctx, simulacao) {
+  const aplicados = [];
+  const falhas = [];
+  for (const it of simulacao.itens) {
+    const body = it.temVariacao
+      ? { item_id: it.itemId, price_list: it.modelos.map((m) => ({ model_id: m.modelId, original_price: m.precoNovo })) }
+      : { item_id: it.itemId, price_list: [{ original_price: it.precoNovo }] };
+    try {
+      const r = await chamarErp('/api/v2/product/update_price', {}, 'POST', body);
+      if (r?.error) falhas.push({ itemId: it.itemId, erro: `${r.error}: ${r.message || ''}`.trim() });
+      else aplicados.push(it.itemId);
+    } catch (e) { falhas.push({ itemId: it.itemId, erro: e.message }); }
+  }
+  return { ok: true, totalAplicados: aplicados.length, totalFalhas: falhas.length, aplicados, falhas };
+}
+
+// Ajusta o estoque de UM produto/variação (uso direto, sem passar pelo fluxo de simulação em massa).
+async function prodAjustarEstoque(chamarErp, ctx, itemId, modelId, novoEstoque) {
+  const body = modelId
+    ? { item_id: itemId, stock_list: [{ model_id: modelId, seller_stock: [{ stock: novoEstoque }] }] }
+    : { item_id: itemId, stock_list: [{ seller_stock: [{ stock: novoEstoque }] }] };
+  const r = await chamarErp('/api/v2/product/update_stock', {}, 'POST', body);
+  if (r?.error) return { ok: false, erro: `${r.error}: ${r.message || ''}`.trim() };
+  return { ok: true };
+}
+
+// Pausa (unlist) ou republica (list) um produto — usado pro auto-pause quando o estoque zera.
+async function prodMudarVisibilidade(chamarErp, ctx, itemId, visivel) {
+  const r = await chamarErp('/api/v2/product/unlist_item', {}, 'POST', { item_list: [{ item_id: itemId, unlist: !visivel }] });
+  if (r?.error) return { ok: false, erro: `${r.error}: ${r.message || ''}`.trim() };
+  const falhouNaLista = r?.response?.failure_list?.find((f) => f.item_id === itemId);
+  if (falhouNaLista) return { ok: false, erro: falhouNaLista.failed_reason || 'A Shopee recusou.' };
+  return { ok: true };
+}
+
+// Varre os produtos de uma loja e pausa automaticamente quem zerou o estoque (não mexe em quem já estava pausado por outro motivo).
+async function prodAutoPausarSemEstoque(chamarErp, ctx, limite = 50) {
+  const lista = await chamarErp('/api/v2/product/get_item_list', { offset: 0, page_size: limite, item_status: 'NORMAL' }, 'GET', null);
+  if (lista?.error) return { ok: false, erro: `${lista.error}: ${lista.message || ''}`.trim() };
+  const itens = lista?.response?.item || [];
+  const pausados = [];
+  const erros = [];
+  for (const it of itens) {
+    const lido = await prodLerProduto(chamarErp, ctx, it.item_id);
+    if (!lido.ok) { erros.push({ itemId: it.item_id, erro: lido.erro }); continue; }
+    const semEstoque = lido.temVariacao
+      ? lido.modelos.length > 0 && lido.modelos.every((m) => (m.estoqueAtual ?? 0) <= 0)
+      : (lido.estoqueAtual ?? 1) <= 0;
+    if (!semEstoque) continue;
+    const r = await prodMudarVisibilidade(chamarErp, ctx, it.item_id, false);
+    if (r.ok) pausados.push(it.item_id); else erros.push({ itemId: it.item_id, erro: r.erro });
+  }
+  return { ok: true, totalVerificados: itens.length, totalPausados: pausados.length, pausados, erros };
+}
+// =================== FIM — PRODUTO ===================
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -561,7 +792,7 @@ export default async function handler(req, res) {
     const { acao } = params;
     // Qual app usar nesta chamada: o front manda "app" = 'gmv' ou 'mkt'.
     // Se não mandar nada, cai no 'gmv' (mantém compatibilidade com o que já existe).
-    const appEscolhido = (params.app === 'mkt' || params.app === 'ads' || params.app === 'produto') ? params.app : 'gmv';
+    const appEscolhido = (params.app === 'mkt' || params.app === 'ads' || params.app === 'produto' || params.app === 'erp') ? params.app : 'gmv';
     const { partnerId, partnerKey, ambiente } = getConfig(appEscolhido);
 
     // -1) Rodar o robô diário de Oferta Relâmpago agora mesmo (botão "Rodar robô agora" do sistema).
@@ -586,13 +817,15 @@ export default async function handler(req, res) {
       const gmv = getConfig('gmv');
       const mkt = getConfig('mkt');
       const ads = getConfig('ads');
+      const erp = getConfig('erp');
       return res.status(200).json({
         ok: true,
         ambiente,
         proxy_usado: false,
         gmv: { partner_id_valor: gmv.partnerId, partner_id_tamanho: gmv.partnerId.length, partner_key_tamanho: gmv.partnerKey.length },
         mkt: { partner_id_valor: mkt.partnerId, partner_id_tamanho: mkt.partnerId.length, partner_key_tamanho: mkt.partnerKey.length },
-        ads: { partner_id_valor: ads.partnerId, partner_id_tamanho: ads.partnerId.length, partner_key_tamanho: ads.partnerKey.length }
+        ads: { partner_id_valor: ads.partnerId, partner_id_tamanho: ads.partnerId.length, partner_key_tamanho: ads.partnerKey.length },
+        erp: { partner_id_valor: erp.partnerId, partner_id_tamanho: erp.partnerId.length, partner_key_tamanho: erp.partnerKey.length }
       });
     }
 
@@ -712,7 +945,7 @@ export default async function handler(req, res) {
       const { access_token, shop_id, status } = params;
       const resultado = await chamarShopee('/api/v2/voucher/get_voucher_list', {
         access_token, shop_id, status: status || 'all', page_size: 100
-      }, 'GET', null, 'mkt');
+      }, 'GET', null, appEscolhido);
       return res.status(200).json({ ok: true, ...resultado });
     }
 
@@ -736,7 +969,7 @@ export default async function handler(req, res) {
         display_channel_list: [1], // 1 = mostrar pra todo mundo na loja (público, sem precisar do código)
         display_start_time: agora
       };
-      const resultado = await chamarShopee('/api/v2/voucher/add_voucher', { access_token, shop_id }, 'POST', corpo, 'mkt');
+      const resultado = await chamarShopee('/api/v2/voucher/add_voucher', { access_token, shop_id }, 'POST', corpo, appEscolhido);
       return res.status(200).json({ ok: true, ...resultado });
     }
 
@@ -745,11 +978,15 @@ export default async function handler(req, res) {
     //    Até "limite_produtos" produtos por oferta, "qtd_por_produto" unidades cada, "percentual"% sobre o preço com desconto.
     if (acao === 'criar_oferta_relampago') {
       const { access_token, shop_id, discount_id, produto_access_token, produto_shop_id } = params;
-      const chamar = (path, q, metodo = 'GET', body = null) => chamarShopee(path, q, metodo, body, 'mkt');
-      // app Produto é opcional: se o cliente ainda não conectou, segue sem o filtro de estoque (tenta e deixa a Shopee recusar).
-      const chamarProduto = (produto_access_token && produto_shop_id)
-        ? (path, q, metodo = 'GET', body = null) => chamarShopee(path, { ...q, access_token: produto_access_token, shop_id: produto_shop_id }, metodo, body, 'produto')
-        : undefined;
+      const chamar = (path, q, metodo = 'GET', body = null) => chamarShopee(path, q, metodo, body, appEscolhido);
+      // Estoque pro filtro: se o cliente já migrou pro app ERP, o MESMO token de cima já tem permissão
+      // de Produto — não precisa pedir um token separado. Se ainda está no Marketing antigo, usa o
+      // produto_access_token separado (app Produto à parte). Sem nenhum dos dois, segue sem filtrar.
+      const chamarProduto = appEscolhido === 'erp'
+        ? (path, q, metodo = 'GET', body = null) => chamarShopee(path, { ...q, access_token, shop_id }, metodo, body, 'erp')
+        : (produto_access_token && produto_shop_id)
+          ? (path, q, metodo = 'GET', body = null) => chamarShopee(path, { ...q, access_token: produto_access_token, shop_id: produto_shop_id }, metodo, body, 'produto')
+          : undefined;
       const r = await descCriarOfertasRelampago(chamar, { accessToken: access_token, shopId: shop_id }, {
         discountId: discount_id || undefined,
         percentual: Number(params.percentual || 5),
@@ -765,10 +1002,110 @@ export default async function handler(req, res) {
         estoque_conhecido: r.estoqueConhecido, amostra_item_desconto: r.amostraItemDesconto, produtos_descartados_por_estoque: r.produtosDescartadosPorEstoque });
     }
 
+    // 8.5) Excluir uma Oferta Relâmpago específica (botão do sistema, não automático).
+    if (acao === 'excluir_oferta') {
+      const { access_token, shop_id, flash_sale_id } = params;
+      if (!flash_sale_id) return res.status(200).json({ ok: false, erro: 'Faltou informar qual oferta excluir.' });
+      const chamar = (path, q, metodo = 'GET', body = null) => chamarShopee(path, q, metodo, body, appEscolhido);
+      const r = await chamar('/api/v2/shop_flash_sale/delete_shop_flash_sale',
+        { access_token, shop_id }, 'POST', { flash_sale_id: Number(flash_sale_id) });
+      console.log('[EXCLUIR OFERTA]', shop_id, flash_sale_id, r?.error ? r.error : 'ok');
+      if (r?.error) return res.status(200).json({ ok: false, erro: `${r.error}: ${r.message || ''}`.trim() });
+      return res.status(200).json({ ok: true });
+    }
+
+    // ============ FINANCEIRO — "Caixa da Loja" (precisa do app ERP) ============
+    if (acao === 'buscar_extrato_financeiro') {
+      const { access_token, shop_id } = params;
+      const chamarErp = (path, q, metodo = 'GET', body = null) => chamarShopee(path, { ...q, access_token, shop_id }, metodo, body, appEscolhido);
+      const r = await finBuscarExtrato(chamarErp, {}, { limite: Number(params.limite || 200) });
+      if (!r.ok) return res.status(200).json({ ok: false, erro: r.erro });
+      const resumo = finResumoSaude(r.transacoes);
+      return res.status(200).json({
+        ok: true, saldoAtual: r.saldoAtual, resumo,
+        transacoes: r.transacoes.slice(0, 50).map(finFormatarTransacao)
+      });
+    }
+
+    // ============ LOGÍSTICA — "Central de Envios" (precisa do app ERP) ============
+    if (acao === 'buscar_rastreio') {
+      const { access_token, shop_id, order_sn } = params;
+      if (!order_sn) return res.status(200).json({ ok: false, erro: 'Faltou informar o pedido (order_sn).' });
+      const chamarErp = (path, q, metodo = 'GET', body = null) => chamarShopee(path, { ...q, access_token, shop_id }, metodo, body, appEscolhido);
+      const r = await logBuscarRastreio(chamarErp, {}, order_sn);
+      return res.status(200).json(r.ok ? { ok: true, ...r } : { ok: false, erro: r.erro });
+    }
+
+    if (acao === 'buscar_rastreio_lote') {
+      const { access_token, shop_id } = params;
+      const orderSns = String(params.order_sns || '').split(',').map((s) => s.trim()).filter(Boolean);
+      if (!orderSns.length) return res.status(200).json({ ok: false, erro: 'Faltou informar os pedidos (order_sns, separados por vírgula).' });
+      const chamarErp = (path, q, metodo = 'GET', body = null) => chamarShopee(path, { ...q, access_token, shop_id }, metodo, body, appEscolhido);
+      const resultados = await logBuscarRastreioEmLote(chamarErp, {}, orderSns, 20);
+      return res.status(200).json({ ok: true, resultados });
+    }
+
+    if (acao === 'buscar_pedidos_recentes') {
+      const { access_token, shop_id } = params;
+      const chamar = (path, q, metodo = 'GET', body = null) => chamarShopee(path, q, metodo, body, appEscolhido);
+      const agora = Math.floor(Date.now() / 1000);
+      const dias = Math.min(Number(params.dias || 14), 15);
+      const r = await chamar('/api/v2/order/get_order_list', { access_token, shop_id, time_range_field: 'create_time', time_from: agora - dias * 86400, time_to: agora, page_size: 30 }, 'GET', null);
+      if (r?.error) return res.status(200).json({ ok: false, erro: `${r.error}: ${r.message || ''}`.trim() });
+      const pedidos = (r?.response?.order_list || []).map((p) => ({ orderSn: p.order_sn, status: p.order_status }));
+      return res.status(200).json({ ok: true, pedidos });
+    }
+
+    // ============ PRODUTO — "Gestão de Catálogo" (precisa do app ERP ou Produto) ============
+    if (acao === 'simular_reajuste_preco') {
+      const { access_token, shop_id } = params;
+      const itemIds = String(params.item_ids || '').split(',').map((s) => s.trim()).filter(Boolean);
+      const percentual = Number(params.percentual);
+      if (!itemIds.length || !Number.isFinite(percentual)) return res.status(200).json({ ok: false, erro: 'Faltou informar os produtos (item_ids) e o percentual.' });
+      const chamarErp = (path, q, metodo = 'GET', body = null) => chamarShopee(path, { ...q, access_token, shop_id }, metodo, body, appEscolhido);
+      const r = await prodSimularReajustePreco(chamarErp, {}, itemIds, percentual);
+      return res.status(200).json(r);
+    }
+
+    if (acao === 'aplicar_reajuste_preco') {
+      const { access_token, shop_id } = params;
+      let simulacao;
+      try { simulacao = JSON.parse(params.simulacao || '{}'); } catch (e) { return res.status(200).json({ ok: false, erro: 'Simulação inválida — rode simular_reajuste_preco de novo e use o resultado sem alterar.' }); }
+      if (!simulacao.itens?.length) return res.status(200).json({ ok: false, erro: 'Simulação vazia — nada pra aplicar.' });
+      const chamarErp = (path, q, metodo = 'GET', body = null) => chamarShopee(path, { ...q, access_token, shop_id }, metodo, body, appEscolhido);
+      const r = await prodAplicarReajustePreco(chamarErp, {}, simulacao);
+      console.log('[REAJUSTE PREÇO]', shop_id, `${r.totalAplicados} aplicado(s), ${r.totalFalhas} falha(s)`);
+      return res.status(200).json(r);
+    }
+
+    if (acao === 'ajustar_estoque') {
+      const { access_token, shop_id, item_id, model_id, novo_estoque } = params;
+      if (!item_id || novo_estoque === undefined) return res.status(200).json({ ok: false, erro: 'Faltou item_id ou novo_estoque.' });
+      const chamarErp = (path, q, metodo = 'GET', body = null) => chamarShopee(path, { ...q, access_token, shop_id }, metodo, body, appEscolhido);
+      const r = await prodAjustarEstoque(chamarErp, {}, Number(item_id), model_id ? Number(model_id) : null, Number(novo_estoque));
+      return res.status(200).json(r);
+    }
+
+    if (acao === 'mudar_visibilidade_produto') {
+      const { access_token, shop_id, item_id, visivel } = params;
+      if (!item_id) return res.status(200).json({ ok: false, erro: 'Faltou item_id.' });
+      const chamarErp = (path, q, metodo = 'GET', body = null) => chamarShopee(path, { ...q, access_token, shop_id }, metodo, body, appEscolhido);
+      const r = await prodMudarVisibilidade(chamarErp, {}, Number(item_id), visivel === 'true');
+      return res.status(200).json(r);
+    }
+
+    if (acao === 'auto_pausar_sem_estoque') {
+      const { access_token, shop_id } = params;
+      const chamarErp = (path, q, metodo = 'GET', body = null) => chamarShopee(path, { ...q, access_token, shop_id }, metodo, body, appEscolhido);
+      const r = await prodAutoPausarSemEstoque(chamarErp, {}, Number(params.limite || 50));
+      console.log('[AUTO-PAUSA PRODUTO]', shop_id, r.ok ? `${r.totalPausados} pausado(s) de ${r.totalVerificados}` : r.erro);
+      return res.status(200).json(r);
+    }
+
     // 9) Sincronizar Ofertas Relâmpago — só CONSULTA o que a loja já tem na Shopee agora, não cria nada.
     if (acao === 'sincronizar_ofertas') {
       const { access_token, shop_id } = params;
-      const chamar = (path, q, metodo = 'GET', body = null) => chamarShopee(path, q, metodo, body, 'mkt');
+      const chamar = (path, q, metodo = 'GET', body = null) => chamarShopee(path, q, metodo, body, appEscolhido);
       const r = await descSincronizarOfertas(chamar, { accessToken: access_token, shopId: shop_id });
       return res.status(200).json({ ok: true, confiavel: r.confiavel, total: r.total, ofertas: r.ofertas });
     }
@@ -776,7 +1113,7 @@ export default async function handler(req, res) {
     // 10) Listar os descontos da loja (app Marketing) — pra equipe escolher qual é o "desconto fixo"
     if (acao === 'listar_descontos') {
       const { access_token, shop_id } = params;
-      const chamar = (path, q, metodo = 'GET', body = null) => chamarShopee(path, q, metodo, body, 'mkt');
+      const chamar = (path, q, metodo = 'GET', body = null) => chamarShopee(path, q, metodo, body, appEscolhido);
       const lista = await descListar(chamar, { accessToken: access_token, shopId: shop_id });
       if (!lista.ok) return res.status(200).json({ ok: false, erro: lista.erro });
       const descontos = lista.descontos
@@ -789,7 +1126,7 @@ export default async function handler(req, res) {
     if (acao === 'duplicar_desconto') {
       const { access_token, shop_id, discount_id } = params;
       if (!discount_id) return res.status(200).json({ ok: false, erro: 'Faltou informar qual desconto duplicar.' });
-      const chamar = (path, q, metodo = 'GET', body = null) => chamarShopee(path, q, metodo, body, 'mkt');
+      const chamar = (path, q, metodo = 'GET', body = null) => chamarShopee(path, q, metodo, body, appEscolhido);
       const r = await descDuplicar(chamar, { accessToken: access_token, shopId: shop_id }, discount_id);
       console.log('[DUPLICAR DESCONTO]', shop_id, discount_id, r.ok ? `ok -> ${r.novoDiscountId} (${r.totalProdutos}/${r.totalOrigem})` : r.erro);
       if (!r.ok) return res.status(200).json({ ok: false, erro: r.erro, detalhe: r });
